@@ -107,8 +107,6 @@ redis_channel_name_prefix = "dask-workers-"
 
 # The Lambdas are only using one channel now that the Scheduler only gets final results. The channel is hard-coded.
 redis_channel_names.append(redis_channel_name_prefix + "1")
-
-redis_channel_names.append(redis_channel_name_prefix + str(i))
                         
 ALLOWED_FAILURES = dask.config.get("distributed.scheduler.allowed-failures")
 
