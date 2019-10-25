@@ -59,6 +59,8 @@ client = Client(local_cluster)
 # Compute the SVD of 'Tall-and-Skinny' Matrix 
 X = da.random.random((200000, 1000), chunks=(10000, 1000))
 u, s, v = da.linalg.svd(X)
+
+# Start the computation.
 v.compute()
 ```
 
@@ -80,6 +82,8 @@ client = Client(local_cluster)
 # Compute the SVD of 'Tall-and-Skinny' Matrix 
 X = da.random.random((10000, 10000), chunks=(2000, 2000))
 u, s, v = da.linalg.svd_compressed(X, k=5)
+
+# Start the computation.
 v.compute()
 ```
 
@@ -102,6 +106,8 @@ client = Client(local_cluster)
 L = range(1024)
 while len(L) > 1:
   L = list(map(delayed(operator.add), L[0::2], L[1::2]))
+
+# Start the computation.
 L[0].compute()
 ```
 
@@ -123,6 +129,8 @@ client = Client(local_cluster)
 x = da.random.random((10000, 10000), chunks = (1000, 1000))
 y = da.random.random((10000, 10000), chunks = (1000, 1000))
 z = da.matmul(x, y)
+
+# Start the computation.
 z.compute() 
 ```
 
@@ -155,6 +163,7 @@ X, y = dask_ml.datasets.make_classification(n_samples=800000,
                                             random_state=800000,
                                             chunks=800000 // 20)
 
+# Start the computation.
 clf.predict(X).compute()
 
 ```
