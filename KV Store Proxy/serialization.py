@@ -11,9 +11,6 @@ import os
 from compression import maybe_compress, decompress
 from utils import nbytes, has_keyword, PY3, PY2
 
-from aws_xray_sdk.core import xray_recorder
-from aws_xray_sdk.core.async_context import AsyncContext
-
 BIG_BYTES_SHARD_SIZE = 2 ** 26
 
 dask_serialize = dask.utils.Dispatch("dask_serialize")
@@ -208,8 +205,7 @@ class Serialized(object):
 
    def __ne__(self, other):
       return not (self == other) 
-
-@xray_recorder.capture(" _extract_serialize")      
+     
 def _extract_serialize(x, ser, path=()):
    if type(x) is dict:
       for k, v in x.items():
@@ -236,7 +232,6 @@ def _extract_serialize(x, ser, path=()):
          ):
             ser[path + (k,)] = v   
    
-@xray_recorder.capture(" extract_serialize")
 def extract_serialize(x):
    """ Pull out Serialize objects from message
 
@@ -316,7 +311,6 @@ def from_frames(frames, deserialize=True, deserializers=None):
    #print("\nRes: ", res)
    raise gen.Return(res)   
 
-@xray_recorder.capture(" dumps_msgpack")   
 def dumps_msgpack(msg):
    """ Dump msg into header and payload, both bytestrings
 
@@ -360,7 +354,6 @@ def loads_msgpack(header, payload):
 
    return msgpack.loads(payload, use_list=False, raw=False, **msgpack_opts)
    
-@xray_recorder.capture(" dumps")
 def dumps(msg, serializers=None, on_error="message", context=None):
    """ Transform Python message to bytestream suitable for communication """
    try:
@@ -514,8 +507,7 @@ def _always_use_pickle_for(x):
       return isinstance(x, (str, bytes))
    else:
       return False
-
-@xray_recorder.capture(" protocol_pickle_dumps")   
+ 
 def protocol_pickle_dumps(x):
    """ Manage between cloudpickle and pickle
    

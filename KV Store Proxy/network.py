@@ -14,17 +14,16 @@ try:
 except ImportError:
    ssl = None
 
+import datetime 
 from datetime import timedelta
 from tornado import gen, netutil
 from tornado.gen import Return
 from tornado.iostream import StreamClosedError, IOStream
 from tornado.tcpclient import TCPClient
 
+from serialization import Serialized, _extract_serialize, extract_serialize, to_frames, dumps, from_frames
 from utils import nbytes, PY3, PY2
 from serialization import to_frames
-
-from aws_xray_sdk.core import xray_recorder
-from aws_xray_sdk.core.async_context import AsyncContext
 
 def get_total_physical_memory():
     try:
@@ -104,13 +103,11 @@ def parse_host_port(address, default_port=None):
 
     return host, int(port)         
      
-@xray_recorder.capture_async("connect to proxy")
 @gen.coroutine
 def connect_to_proxy(addr, port):
    stream = yield TCPClient().connect(addr, port)
    raise gen.Return(stream)
 
-@xray_recorder.capture_async("connect_to_address")
 @gen.coroutine
 def connect_to_address(addr, timeout = None, deserialize = True, connection_args = None):         
    """
@@ -154,7 +151,6 @@ def connect_to_address(addr, timeout = None, deserialize = True, connection_args
          break         
    raise gen.Return(comm)      
 
-@xray_recorder.capture_async("connect")
 @gen.coroutine
 def connect(address, deserialize = True, **connection_args):
    ip, port = parse_host_port(address)
@@ -329,59 +325,48 @@ class TCP():
       """   
       return self._peer_addr
 
-   #@gen.coroutine
-   #def read(self, deserializers=None):
-      """
-      Read and return a message (a Python object).
+   @gen.coroutine
+   def read(self, deserializers=None):
+      # print("[ {} ] Attempting to read in TCP Comm...".format(datetime.datetime.utcnow()))
+      stream = self.stream
+      if stream is None:
+         raise CommClosedError
 
-      This method is a coroutine.
+      try:
+         n_frames = yield stream.read_bytes(8)
+         n_frames = struct.unpack("Q", n_frames)[0]
+         lengths = yield stream.read_bytes(8 * n_frames)
+         lengths = struct.unpack("Q" * n_frames, lengths)
 
-      Parameters
-      ----------
-      deserializers : Optional[Dict[str, Tuple[Callable, Callable, bool]]]
-         An optional dict appropriate for distributed.protocol.deserialize.
-         See :ref:`serialization` for more.
-      """   
-   #   stream = self.stream
-   #   if stream is None:
-   #      raise CommClosedError
-   #
-   #   try:
-   #      n_frames = yield stream.read_bytes(8)
-   #      n_frames = struct.unpack("Q", n_frames)[0]
-   #      lengths = yield stream.read_bytes(8 * n_frames)
-   #      lengths = struct.unpack("Q" * n_frames, lengths)
-   #
-   #      frames = []
-   #      for length in lengths:
-   #         if length:
-   #            if PY3 and self._iostream_has_read_into:
-   #               frame = bytearray(length)
-   #               n = yield stream.read_into(frame)
-   #               assert n == length, (n, length)
-   #            else:
-   #               frame = yield stream.read_bytes(length)
-   #         else:
-   #            frame = b""
-   #         frames.append(frame)
-   #   except StreamClosedError as e:
-   #      self.stream = None
-   #      # print("StreamClosedError...")
-   #      if not shutting_down():
-   #         convert_stream_closed_error(self, e)
-   #   else:
-   #      try:
-   #         msg = yield from_frames(
-   #            frames, deserialize=self.deserialize, deserializers=deserializers
-   #         )
-   #      except EOFError:
-   #         # Frames possibly garbled or truncated by communication error
-   #         self.abort()
-   #         # print("aborted stream on truncated data")
-   #         raise CommClosedError("aborted stream on truncated data")
-   #      raise gen.Return(msg)
+         frames = []
+         # print("[ {} ] Reading {} lengths now...".format(datetime.datetime.utcnow(), len(lengths)))
+         for length in lengths:
+            if length:
+               if PY3 and self._iostream_has_read_into:
+                  frame = bytearray(length)
+                  n = yield stream.read_into(frame)
+                  assert n == length, (n, length)
+               else:
+                  frame = yield stream.read_bytes(length)
+            else:
+               frame = b""
+            frames.append(frame)
+      except StreamClosedError as e:
+         self.stream = None
+         print("StreamClosedError...")
+         raise StreamClosedError("Stream closed...")
+      else:
+         try:
+            msg = yield from_frames(
+               frames, deserialize=self.deserialize, deserializers=deserializers
+            )
+         except EOFError:
+            # Frames possibly garbled or truncated by communication error
+            self.abort()
+            # print("aborted stream on truncated data")
+            raise CommClosedError("aborted stream on truncated data")
+      raise gen.Return(msg)
 
-   @xray_recorder.capture_async("TCP-write")
    @gen.coroutine
    def write(self, msg, serializers=None, on_error="message"):
       """
