@@ -125,3 +125,36 @@ y = da.random.random((10000, 10000), chunks = (1000, 1000))
 z = da.matmul(x, y)
 z.compute() 
 ```
+
+### Parallelizing Prediction (sklearn.svm.SVC)
+``` python
+import pandas as pd
+import seaborn as sns
+import sklearn.datasets
+from sklearn.svm import SVC
+
+import dask_ml.datasets
+from dask_ml.wrappers import ParallelPostFit
+from distributed import LocalCluster, Client
+local_cluster = LocalCluster(host = "ec2-203-0-113-25.compute-1.amazonaws.com",
+                             n_workers = 0,
+                             proxy_address = "ec2-204-0-113-25.compute-1.amazonaws.com",
+                             proxy_port = 8989,
+                             redis_endpoints = [("ec2-205-0-113-25.compute-1.amazonaws.com", 6379),
+                                                ("ec2-206-0-113-25.compute-1.amazonaws.com", 6379),
+                                                ("ec2-207-0-113-25.compute-1.amazonaws.com", 6379)],
+                             num_lambda_invokers = 10,
+                             max_task_fanout = 10)
+client = Client(local_cluster)
+
+X, y = sklearn.datasets.make_classification(n_samples=1000)
+clf = ParallelPostFit(SVC(gamma='scale'))
+clf.fit(X, y)
+
+X, y = dask_ml.datasets.make_classification(n_samples=800000,
+                                            random_state=800000,
+                                            chunks=800000 // 20)
+
+clf.predict(X).compute()
+
+```
