@@ -45,7 +45,7 @@ LocalCluster(object):
 ```python
 import dask.array as da
 from distributed import LocalCluster, Client
-local_cluster = LocalCluster(host = "ec2-203-0-113-25.compute-1.amazonaws.com",
+local_cluster = LocalCluster(host = "ec2-203-0-113-25.compute-1.amazonaws.com:8786",
                              n_workers = 0,
                              proxy_address = "ec2-204-0-113-25.compute-1.amazonaws.com",
                              proxy_port = 8989,
@@ -68,7 +68,7 @@ v.compute()
 ```python
 import dask.array as da
 from distributed import LocalCluster, Client
-local_cluster = LocalCluster(host = "ec2-203-0-113-25.compute-1.amazonaws.com",
+local_cluster = LocalCluster(host = "ec2-203-0-113-25.compute-1.amazonaws.com:8786",
                              n_workers = 0,
                              proxy_address = "ec2-204-0-113-25.compute-1.amazonaws.com",
                              proxy_port = 8989,
@@ -92,7 +92,7 @@ v.compute()
 from dask import delayed 
 import operator 
 from distributed import LocalCluster, Client
-local_cluster = LocalCluster(host = "ec2-203-0-113-25.compute-1.amazonaws.com",
+local_cluster = LocalCluster(host = "ec2-203-0-113-25.compute-1.amazonaws.com:8786",
                              n_workers = 0,
                              proxy_address = "ec2-204-0-113-25.compute-1.amazonaws.com",
                              proxy_port = 8989,
@@ -115,7 +115,7 @@ L[0].compute()
 ``` python
 import dask.array as da
 from distributed import LocalCluster, Client
-local_cluster = LocalCluster(host = "ec2-203-0-113-25.compute-1.amazonaws.com",
+local_cluster = LocalCluster(host = "ec2-203-0-113-25.compute-1.amazonaws.com:8786",
                              n_workers = 0,
                              proxy_address = "ec2-204-0-113-25.compute-1.amazonaws.com",
                              proxy_port = 8989,
@@ -144,7 +144,7 @@ from sklearn.svm import SVC
 import dask_ml.datasets
 from dask_ml.wrappers import ParallelPostFit
 from distributed import LocalCluster, Client
-local_cluster = LocalCluster(host = "ec2-203-0-113-25.compute-1.amazonaws.com",
+local_cluster = LocalCluster(host = "ec2-203-0-113-25.compute-1.amazonaws.com:8786",
                              n_workers = 0,
                              proxy_address = "ec2-204-0-113-25.compute-1.amazonaws.com",
                              proxy_port = 8989,
