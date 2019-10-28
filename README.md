@@ -22,7 +22,8 @@ In the following examples, modifying the value of the *chunks* parameter will es
 ```
 LocalCluster(object):
   host : string
-    The public DNS IPv4 address associated with the EC2 instance on which the Scheduler process is executing.
+    The public DNS IPv4 address associated with the EC2 instance on which the Scheduler process is executing, along with the port on 
+    which the Scheduler is listening. The format of this string should be "IPv4:port". 
   n_workers : int,
     Artifact from Dask. Leave this at zero.
   proxy_adderss : string,
