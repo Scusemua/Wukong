@@ -21,6 +21,8 @@ The code for the AWS Lambda function (i.e., Task Executor) has also changed cons
 
 At a high level, there are two distinct ways tasks are processed after being executed. The way that the task is processed depends on whether or not its intermediate output data is large or small (based on a user-defined threshold). If it is small, then the processing is basically the same as before (and occurs in the `process_small` function). If the data is large, then, as mentioned, the Lambda will attempt to execute downstream tasks locally if at all possible. This is done in the `process_big` function. 
 
+The `chunk_task_threshold` parameter to `LocalCluster` is currently being used to determine whether intermediate data is large enough to warrant executing downstream tasks locally or not. If `size(DATA) >= chunk_task_threshold` then the downstream tasks would be executed locally if circumstances permit (i.e., they're ready to execute). Note that the units of `chunk_task_threshold` are bytes. 
+
 As far as running Wukong goes, the Lambda function (Task Executor) now needs to be given a hard-coded list of the "large object" Redis shards and the "small object" Redis shards. The format for these lists is `[(IP_1, Port_1), (IP_2, Port_2), ..., (IP_n, Port_n)]`. The variables are at the top of `function.py` in the "AWS Lambda Task Executor" folder. 
 
 The command for starting the KV Store Proxy has also changed. If you use the script mentioned above, then the command will be generated for you. (You'll just need to copy-and-paste it into your terminal). 
@@ -89,21 +91,31 @@ LocalCluster(object):
     task invocation. The principle here is the same as with the initial task invokers. Our tests found that invoking Lambda functions
     takes about 50ms on average. As a result, if a given Task T has a large fanout (i.e., there are a large number of downstream tasks 
     directly dependent on T), then it may be advantageous to parallelize the invocation of these downstream tasks.
+  chunk_task_threshold : int
+    The threshold (in bytes) for determining whether or not to execute downstream tasks locally. More specifically, if the intermediate
+    output data of a task is greater than or equal to 'chunk_task_threshold', then the Task Executor will attempt to execute the task's
+    downstream tasks locally. This limits the amount of large-object network communication that has to occur, thereby speeding up the
+    execution of the workload considerably.
 ```
 
 ### SVD of 'Tall-and-Skinny' Matrix 
 ```python
 import dask.array as da
 from distributed import LocalCluster, Client
-local_cluster = LocalCluster(host = "ec2-203-0-113-25.compute-1.amazonaws.com:8786",
-                             n_workers = 0,
-                             proxy_address = "ec2-204-0-113-25.compute-1.amazonaws.com",
-                             proxy_port = 8989,
-                             redis_endpoints = [("ec2-205-0-113-25.compute-1.amazonaws.com", 6379),
-                                                ("ec2-206-0-113-25.compute-1.amazonaws.com", 6379),
-                                                ("ec2-207-0-113-25.compute-1.amazonaws.com", 6379)],
-                             num_lambda_invokers = 10,
-                             max_task_fanout = 10)
+lc = LocalCluster(host='ec2-3-16-83-131.us-east-2.compute.amazonaws.com:8786',
+                  proxy_address = 'ec2-3-133-154-219.us-east-2.compute.amazonaws.com',
+                  big_redis_endpoints = [('ec2-3-21-228-179.us-east-2.compute.amazonaws.com', 6379),
+                                         ('ec2-66-112-34-62.us-east-2.compute.amazonaws.com', 6379),
+                                         ('ec2-240-186-137-25.us-east-2.compute.amazonaws.com', 6379),
+                                         ('ec2-39-204-234-155.us-east-2.compute.amazonaws.com', 6379)],
+                  small_redis_endpoints = [('ec2-18-191-192-13.us-east-2.compute.amazonaws.com', 6379),
+                                           ('ec2-18-224-33-31.us-east-2.compute.amazonaws.com', 6379)],
+                  n_workers = 0,
+                  proxy_port = 8989,
+                  num_lambda_invokers = 30,
+                  chunk_task_threshold = 10000000,
+                  max_task_fanout = 30,
+                  aws_region = "us-east-2") 
 client = Client(local_cluster)
 
 # Compute the SVD of 'Tall-and-Skinny' Matrix 
@@ -118,15 +130,20 @@ v.compute()
 ```python
 import dask.array as da
 from distributed import LocalCluster, Client
-local_cluster = LocalCluster(host = "ec2-203-0-113-25.compute-1.amazonaws.com:8786",
-                             n_workers = 0,
-                             proxy_address = "ec2-204-0-113-25.compute-1.amazonaws.com",
-                             proxy_port = 8989,
-                             redis_endpoints = [("ec2-205-0-113-25.compute-1.amazonaws.com", 6379),
-                                                ("ec2-206-0-113-25.compute-1.amazonaws.com", 6379),
-                                                ("ec2-207-0-113-25.compute-1.amazonaws.com", 6379)],
-                             num_lambda_invokers = 10,
-                             max_task_fanout = 10)
+lc = LocalCluster(host='ec2-3-16-83-131.us-east-2.compute.amazonaws.com:8786',
+                  proxy_address = 'ec2-3-133-154-219.us-east-2.compute.amazonaws.com',
+                  big_redis_endpoints = [('ec2-3-21-228-179.us-east-2.compute.amazonaws.com', 6379),
+                                         ('ec2-66-112-34-62.us-east-2.compute.amazonaws.com', 6379),
+                                         ('ec2-240-186-137-25.us-east-2.compute.amazonaws.com', 6379),
+                                         ('ec2-39-204-234-155.us-east-2.compute.amazonaws.com', 6379)],
+                  small_redis_endpoints = [('ec2-18-191-192-13.us-east-2.compute.amazonaws.com', 6379),
+                                           ('ec2-18-224-33-31.us-east-2.compute.amazonaws.com', 6379)],
+                  n_workers = 0,
+                  proxy_port = 8989,
+                  num_lambda_invokers = 30,
+                  chunk_task_threshold = 10000000,
+                  max_task_fanout = 30,
+                  aws_region = "us-east-2") 
 client = Client(local_cluster)
 
 # Compute the SVD of 'Tall-and-Skinny' Matrix 
@@ -142,15 +159,20 @@ v.compute()
 from dask import delayed 
 import operator 
 from distributed import LocalCluster, Client
-local_cluster = LocalCluster(host = "ec2-203-0-113-25.compute-1.amazonaws.com:8786",
-                             n_workers = 0,
-                             proxy_address = "ec2-204-0-113-25.compute-1.amazonaws.com",
-                             proxy_port = 8989,
-                             redis_endpoints = [("ec2-205-0-113-25.compute-1.amazonaws.com", 6379),
-                                                ("ec2-206-0-113-25.compute-1.amazonaws.com", 6379),
-                                                ("ec2-207-0-113-25.compute-1.amazonaws.com", 6379)],
-                             num_lambda_invokers = 10,
-                             max_task_fanout = 10)
+lc = LocalCluster(host='ec2-3-16-83-131.us-east-2.compute.amazonaws.com:8786',
+                  proxy_address = 'ec2-3-133-154-219.us-east-2.compute.amazonaws.com',
+                  big_redis_endpoints = [('ec2-3-21-228-179.us-east-2.compute.amazonaws.com', 6379),
+                                         ('ec2-66-112-34-62.us-east-2.compute.amazonaws.com', 6379),
+                                         ('ec2-240-186-137-25.us-east-2.compute.amazonaws.com', 6379),
+                                         ('ec2-39-204-234-155.us-east-2.compute.amazonaws.com', 6379)],
+                  small_redis_endpoints = [('ec2-18-191-192-13.us-east-2.compute.amazonaws.com', 6379),
+                                           ('ec2-18-224-33-31.us-east-2.compute.amazonaws.com', 6379)],
+                  n_workers = 0,
+                  proxy_port = 8989,
+                  num_lambda_invokers = 30,
+                  chunk_task_threshold = 10000000,
+                  max_task_fanout = 30,
+                  aws_region = "us-east-2") 
 client = Client(local_cluster)
 
 L = range(1024)
@@ -165,15 +187,20 @@ L[0].compute()
 ``` python
 import dask.array as da
 from distributed import LocalCluster, Client
-local_cluster = LocalCluster(host = "ec2-203-0-113-25.compute-1.amazonaws.com:8786",
-                             n_workers = 0,
-                             proxy_address = "ec2-204-0-113-25.compute-1.amazonaws.com",
-                             proxy_port = 8989,
-                             redis_endpoints = [("ec2-205-0-113-25.compute-1.amazonaws.com", 6379),
-                                                ("ec2-206-0-113-25.compute-1.amazonaws.com", 6379),
-                                                ("ec2-207-0-113-25.compute-1.amazonaws.com", 6379)],
-                             num_lambda_invokers = 10,
-                             max_task_fanout = 10)
+lc = LocalCluster(host='ec2-3-16-83-131.us-east-2.compute.amazonaws.com:8786',
+                  proxy_address = 'ec2-3-133-154-219.us-east-2.compute.amazonaws.com',
+                  big_redis_endpoints = [('ec2-3-21-228-179.us-east-2.compute.amazonaws.com', 6379),
+                                         ('ec2-66-112-34-62.us-east-2.compute.amazonaws.com', 6379),
+                                         ('ec2-240-186-137-25.us-east-2.compute.amazonaws.com', 6379),
+                                         ('ec2-39-204-234-155.us-east-2.compute.amazonaws.com', 6379)],
+                  small_redis_endpoints = [('ec2-18-191-192-13.us-east-2.compute.amazonaws.com', 6379),
+                                           ('ec2-18-224-33-31.us-east-2.compute.amazonaws.com', 6379)],
+                  n_workers = 0,
+                  proxy_port = 8989,
+                  num_lambda_invokers = 30,
+                  chunk_task_threshold = 10000000,
+                  max_task_fanout = 30,
+                  aws_region = "us-east-2") 
 client = Client(local_cluster)
 
 x = da.random.random((10000, 10000), chunks = (1000, 1000))
@@ -194,15 +221,20 @@ from sklearn.svm import SVC
 import dask_ml.datasets
 from dask_ml.wrappers import ParallelPostFit
 from distributed import LocalCluster, Client
-local_cluster = LocalCluster(host = "ec2-203-0-113-25.compute-1.amazonaws.com:8786",
-                             n_workers = 0,
-                             proxy_address = "ec2-204-0-113-25.compute-1.amazonaws.com",
-                             proxy_port = 8989,
-                             redis_endpoints = [("ec2-205-0-113-25.compute-1.amazonaws.com", 6379),
-                                                ("ec2-206-0-113-25.compute-1.amazonaws.com", 6379),
-                                                ("ec2-207-0-113-25.compute-1.amazonaws.com", 6379)],
-                             num_lambda_invokers = 10,
-                             max_task_fanout = 10)
+lc = LocalCluster(host='ec2-3-16-83-131.us-east-2.compute.amazonaws.com:8786',
+                  proxy_address = 'ec2-3-133-154-219.us-east-2.compute.amazonaws.com',
+                  big_redis_endpoints = [('ec2-3-21-228-179.us-east-2.compute.amazonaws.com', 6379),
+                                         ('ec2-66-112-34-62.us-east-2.compute.amazonaws.com', 6379),
+                                         ('ec2-240-186-137-25.us-east-2.compute.amazonaws.com', 6379),
+                                         ('ec2-39-204-234-155.us-east-2.compute.amazonaws.com', 6379)],
+                  small_redis_endpoints = [('ec2-18-191-192-13.us-east-2.compute.amazonaws.com', 6379),
+                                           ('ec2-18-224-33-31.us-east-2.compute.amazonaws.com', 6379)],
+                  n_workers = 0,
+                  proxy_port = 8989,
+                  num_lambda_invokers = 30,
+                  chunk_task_threshold = 10000000,
+                  max_task_fanout = 30,
+                  aws_region = "us-east-2")  
 client = Client(local_cluster)
 
 X, y = sklearn.datasets.make_classification(n_samples=1000)
