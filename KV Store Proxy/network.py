@@ -14,16 +14,14 @@ try:
 except ImportError:
    ssl = None
 
-import datetime 
 from datetime import timedelta
 from tornado import gen, netutil
 from tornado.gen import Return
 from tornado.iostream import StreamClosedError, IOStream
 from tornado.tcpclient import TCPClient
 
-from serialization import Serialized, _extract_serialize, extract_serialize, to_frames, dumps, from_frames
 from utils import nbytes, PY3, PY2
-from serialization import to_frames
+import serialization
 
 def get_total_physical_memory():
     try:
@@ -102,11 +100,6 @@ def parse_host_port(address, default_port=None):
             _fail()
 
     return host, int(port)         
-     
-@gen.coroutine
-def connect_to_proxy(addr, port):
-   stream = yield TCPClient().connect(addr, port)
-   raise gen.Return(stream)
 
 @gen.coroutine
 def connect_to_address(addr, timeout = None, deserialize = True, connection_args = None):         
@@ -357,7 +350,7 @@ class TCP():
          raise StreamClosedError("Stream closed...")
       else:
          try:
-            msg = yield from_frames(
+            msg = yield serialization.from_frames(
                frames, deserialize=self.deserialize, deserializers=deserializers
             )
          except EOFError:
@@ -386,7 +379,7 @@ class TCP():
       if stream is None:
          raise CommClosedError
 
-      frames = yield to_frames(
+      frames = yield serialization.to_frames(
          msg,
          serializers=serializers,
          on_error=on_error,
@@ -411,7 +404,7 @@ class TCP():
                # ("If write is called again before that Future has resolved,
                #   the previous future will be orphaned and will never resolve")
                if not self._iostream_allows_memoryview:
-                  frame = ensure_bytes(frame)
+                  frame = serialization.ensure_bytes(frame)
                future = stream.write(frame)
                bytes_since_last_yield += nbytes(frame)
                if bytes_since_last_yield > 32e6:

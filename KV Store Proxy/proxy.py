@@ -20,7 +20,8 @@ import struct
 from collections import defaultdict
 import pickle
 import cloudpickle 
-import json
+#import json
+import ujson
 import multiprocessing
 import base64
 import boto3 
@@ -32,8 +33,8 @@ from multiprocessing import Pipe, Process
 import queue 
 from uhashring import HashRing 
 
-from serialization import Serialized, _extract_serialize, extract_serialize, to_frames, dumps, from_frames
-from network import CommClosedError, FatalCommClosedError, parse_address, parse_host_port, connect_to_address, get_stream_address, unparse_host_port, TCP, connect_to_proxy
+from serialization import Serialized, dumps, from_frames
+from network import CommClosedError, get_stream_address, TCP
 from proxy_lambda_invoker import ProxyLambdaInvoker 
 
 from tornado.ioloop import IOLoop
@@ -50,22 +51,16 @@ define('proxy_port', default=8989, help="TCP port to use for the proxy itself")
 define('encoding', default='utf-8', help="String encoding")
 define('redis_port1', default=6379, help="Port for the Redis cluster")
 define('redis_port2', default=6380, help="Port for the Redis cluster")
-define('redis_endpoint', default="ec2-3-89-228-222.compute-1.amazonaws.com", help="IP Address of the Redis cluster")
-
-# TO-DO:
-# - Synchronize message handling / processing. There could be race conditions where 'set' gets called
-#   while still processing the "graph-init" operation, meaning downstream tasks may not be locally available yet.
-#   Need to address this possibility.
-
-class CommClosedError(IOError):
-    pass
+define('redis_endpoint', default="ecX-X-XX-XXX-XXX.compute-1.amazonaws.com", help="IP Address of the Redis cluster")
 
 class RedisProxy(object):
     """Tornado asycnrhonous TCP server co-located with a Redis cluster."""
 
-    def __init__(self, redis_endpoints, lambda_client):
-        self.redis_endpoints = redis_endpoints
+    def __init__(self, big_redis_endpoints, small_redis_endpoints, lambda_client, print_debug = False):
+        self.big_redis_endpoints = big_redis_endpoints
+        self.small_redis_endpoints = small_redis_endpoints
         self.lambda_client = lambda_client
+        self.print_debug = print_debug
         self.completed_tasks = set()
 
         self.scheduler_address = ""                 # The address of the modified Dask Distributed scheduler 
@@ -77,9 +72,6 @@ class RedisProxy(object):
                 "graph-init": self.handle_graph_init,
                 "start": self.handle_start
             }
-        
-    def task_completed(task_key):
-        task_dependencies_key = task_key + "--deps"
 
     def start(self):
         self.server = TCPServer()
@@ -101,39 +93,52 @@ class RedisProxy(object):
     @gen.coroutine
     def connect_to_redis_servers(self):
         print("[ {} ] Connecting to Redis servers...".format(datetime.datetime.utcnow()))
-        self.redis_clients = []
-        self.redis_nodes = dict()
+        self.big_redis_clients = []
+        self.small_redis_clients = []
+        self.big_redis_nodes = dict()
+        self.small_redis_nodes = dict()
         counter = 1 
 
-        for IP, port in self.redis_endpoints:
-            print("[ {} ] Attempting to connect to Redis server {}/{} at {}:{}".format(datetime.datetime.utcnow(), counter, len(self.redis_endpoints), IP, port))
+        for IP, port in self.big_redis_endpoints:
+            print("[ {} ] Attempting to connect to Big Redis server {}/{} at {}:{}".format(datetime.datetime.utcnow(), counter, len(self.big_redis_endpoints), IP, port))
             connection = yield aioredis.create_connection(address = (IP, port), loop = IOLoop.current().asyncio_loop, encoding = options.encoding) #redis.StrictRedis(host=IP, port = port, db = 0)
             redis_client = aioredis.Redis(connection)
-            print("[ {} ] Successfully connected to Redis server {}.".format(datetime.datetime.utcnow(), counter))
-            self.redis_clients.append(redis_client)
+            print("[ {} ] Successfully connected to Big Redis server {}.".format(datetime.datetime.utcnow(), counter))
+            self.big_redis_clients.append(redis_client)
             key_string = "node-" + str(IP) + ":" + str(port)
-            self.redis_nodes[key_string] = {
+            self.big_redis_nodes[key_string] = {
                 "hostname": key_string + ".FQDN",
                 "nodename": key_string,
                 "instance": redis_client,
                 "port": port,
-                "vnodes": 40
+                "vnodes": 200
             }
             counter += 1
+        
+        counter = 1
+        for IP, port in self.small_redis_endpoints:
+            print("[ {} ] Attempting to connect to Small Redis server {}/{} at {}:{}".format(datetime.datetime.utcnow(), counter, len(self.small_redis_endpoints), IP, port))
+            connection = yield aioredis.create_connection(address = (IP, port), loop = IOLoop.current().asyncio_loop, encoding = options.encoding) #redis.StrictRedis(host=IP, port = port, db = 0)
+            redis_client = aioredis.Redis(connection)
+            print("[ {} ] Successfully connected to Small Redis server {}.".format(datetime.datetime.utcnow(), counter))
+            self.small_redis_clients.append(redis_client)
+            key_string = "node-" + str(IP) + ":" + str(port)
+            self.small_redis_nodes[key_string] = {
+                "hostname": key_string + ".FQDN",
+                "nodename": key_string,
+                "instance": redis_client,
+                "port": port,
+                "vnodes": 200
+            }
+            counter += 1            
 
-        self.hash_ring = HashRing(self.redis_nodes)
-        #for port in self.redis_ports:
-        #    print("[ {} ] Attempting to connect to Redis server {}/{} at {}:{}".format(datetime.datetime.utcnow(), counter, len(self.redis_ports), self.redis_endpoint, port))
-        #    #connection = IOLoop.current().run_sync(lambda: aioredis.create_connection(address = (self.redis_endpoint, port), loop = IOLoop.current().asyncio_loop, encoding = options.encoding))
-        #    connection = yield aioredis.create_connection(address = (self.redis_endpoint, port), loop = IOLoop.current().asyncio_loop, encoding = options.encoding)
-        #    redis_client = aioredis.Redis(connection)
-        #    self.redis_clients.append(redis_client)
-        #    counter = counter + 1 
-        self.num_redis_clients = len(self.redis_clients)
+        self.big_hash_ring = HashRing(self.big_redis_nodes, hash_fn='ketama')
+        self.small_hash_ring = HashRing(self.small_redis_nodes, hash_fn='ketama')
 
     @gen.coroutine
-    def process_task(self, task_key, _value_encoded = None, message = None, print_debug = False):      
-        #print("[ {} ] Processing task {} now...".format(datetime.datetime.utcnow(), task_key))
+    def process_task(self, task_key, _value_encoded = None, message = None):      
+        if self.print_debug:
+            print("[ {} ] Processing task {} now...".format(datetime.datetime.utcnow(), task_key))
         
         # Decode the value but keep it serialized.              
         value_encoded = _value_encoded or message["value-encoded"]
@@ -142,11 +147,14 @@ class RedisProxy(object):
         task_payload = task_node.task_payload
 
         # Store the result in redis.
-        #yield self.get_redis_client(task_key).set(task_key, value_serialized)
-        
-        redis_client = self.hash_ring.get_node_instance(task_key) #[task_key].set(task_key, value_serialized)
-        print("[ {} ] Storing task {} in Redis client listening at {}".format(datetime.datetime.utcnow(), task_key, redis_client.address))
-        yield redis_client.set(task_key, value_serialized)
+        if sys.getsizeof(value_serialized) > task_payload["storage_threshold"]:
+            redis_instance = self.big_hash_ring.get_node_instance(task_key) #[task_key].set(task_key, value_serialized)
+            print("[ {} ] Storing task {} in Big Redis instance listening at {}".format(datetime.datetime.utcnow(), task_key, redis_instance.address))
+            yield redis_instance.set(task_key, value_serialized)
+        else:
+            redis_instance = self.small_hash_ring.get_node_instance(task_key) #[task_key].set(task_key, value_serialized)
+            print("[ {} ] Storing task {} in Small Redis instance listening at {}".format(datetime.datetime.utcnow(), task_key, redis_instance.address))
+            yield redis_instance.set(task_key, value_serialized)
 
         self.completed_tasks.add(task_key)
 
@@ -155,8 +163,8 @@ class RedisProxy(object):
 
         print("[ {} ] Value for {} successfully stored in Redis. Checking dependencies/invoke nodes now...".format(datetime.datetime.utcnow(), task_key))
 
-        #if print_debug:
-        #    print("[ {} ] [PROCESSING] Now processing the downstream tasks for task {}".format(datetime.datetime.utcnow(), task_key))
+        if self.print_debug:
+            print("[ {} ] [PROCESSING] Now processing the downstream tasks for task {}".format(datetime.datetime.utcnow(), task_key))
 
         for invoke_key in task_node.invoke:
             futures = []
@@ -171,8 +179,7 @@ class RedisProxy(object):
 
             # We create a pipeline for incrementing the counter and getting its value (atomically). 
             # We do this to reduce the number of round trips required for this step of the process.
-            #redis_pipeline = self.get_redis_client(invoke_key).pipeline()
-            redis_pipeline = self.hash_ring.get_node_instance(invoke_key).pipeline()
+            redis_pipeline = self.small_hash_ring.get_node_instance(invoke_key).pipeline()
 
             futures.append(redis_pipeline.incr(dependency_counter_key))  # Enqueue the atomic increment operation.
             futures.append(redis_pipeline.get(dependency_counter_key))   # Enqueue the atomic get operation AFTER the increment operation.
@@ -187,16 +194,18 @@ class RedisProxy(object):
             # Check if the task is ready for execution. If it is, put it in the "can_now_execute" list. 
             # If the task is not yet ready, then we don't do anything further with it at this point.
             if dependencies_completed == num_dependencies:
-                # print("[DEP. CHECKING] - task {} is now ready to execute as all {} dependencies have been computed.".format(invoke_key, num_dependencies))
+                if self.print_debug:
+                    print("[DEP. CHECKING] - task {} is now ready to execute as all {} dependencies have been computed.".format(invoke_key, num_dependencies))
                 can_now_execute.append(invoke_node)
-            # else:
-                # print("[DEP. CHECKING] - task {} cannot execute yet. Only {} out of {} dependencies have been computed.".format(invoke_key, dependencies_completed, num_dependencies))
-                # print("\nMissing dependencies: ")
-                # deps = invoke_node.task_payload["dependencies"]
-                # for dep_task_key in deps:
-                #     if dep_task_key not in self.completed_tasks:
-                #         print("     ", dep_task_key)
-                # print("\n")
+            else:
+                if self.print_debug:
+                    print("[DEP. CHECKING] - task {} cannot execute yet. Only {} out of {} dependencies have been computed.".format(invoke_key, dependencies_completed, num_dependencies))
+                    print("\nMissing dependencies: ")
+                    deps = invoke_node.task_payload["dependencies"]
+                    for dep_task_key in deps:
+                        if dep_task_key not in self.completed_tasks:
+                            print("     ", dep_task_key)
+                            print("\n")
             
         # Invoke all of the ready-to-execute tasks in parallel.
         # print("[ {} ] Invoking {} of the {} downstream tasks of current task {}:".format(datetime.datetime.utcnow(), len(can_now_execute), len(task_node.invoke), task_key))
@@ -204,11 +213,29 @@ class RedisProxy(object):
         #     print("     ", node.task_key)
         # print("\n")
         for invoke_node in can_now_execute:
+            # We're going to check and see if we can send the previous task's data along with the path. 
+            # If not, then the Lambda function will just have to retrieve the data from Redis instead.
             payload = self.serialized_paths[invoke_node.task_key]
+            payload_size = sys.getsizeof(payload)
+            relevant_data_size = sys.getsizeof(value_encoded)
+            combined_size = payload_size + relevant_data_size
             # We can only send a payload of size 256,000 bytes or less to a Lambda function directly.
-            # If the payload is too large, then the Lambda will retrieve it from Redis via the key we provide.
-            if sys.getsizeof(payload) > 256000:
-                payload = json.dumps({"path-key": invoke_node.task_key + "---path"})
+            # If the payload is too large, then the Lambda will retrieve the data from Redis.
+            if combined_size < 256000:
+                #print("Payload (before any deserialization or anything): ", payload)
+
+                # Deserialize the payload so we can modify it. 
+                payload = ujson.loads(payload)
+
+                # Add the data for 'this' task to the payload. The Lambda function expects the value to be 
+                # in a dictionary stored at key "previous-results". The value should be encoded.
+                payload["previous-results"] = {task_key: value_encoded}
+                payload["invoked-by"] = task_key
+                # Re-serialize the payload.
+                payload = ujson.dumps(payload)
+            # If the path + data was too big, see if we can get away with just sending the path. If not, then the Lambda can get that from Redis too.
+            elif sys.getsizeof(payload) > 256000:
+                payload = ujson.dumps({"path-key": invoke_node.task_key + "---path", "invoked-by": task_key})
             self.lambda_invoker.send(payload)            
 
     @gen.coroutine
@@ -288,7 +315,7 @@ class RedisProxy(object):
         # client_keys = [list() for redis_client in self.redis_clients]
 
         for key in path_keys:
-            client = self.hash_ring.get_node_instance(key[:-7])
+            client = self.big_hash_ring.get_node_instance(key[:-7])
             client_keys[client].append(key)
 
         #for key in path_keys:
@@ -318,7 +345,7 @@ class RedisProxy(object):
         # Iterate over all of the serialized paths and deserialize them/deserialize the nodes.
         starting_nodes = len(self.path_nodes)
         for serialized_path in responses:
-            path = json.loads(serialized_path)
+            path = ujson.loads(serialized_path)
             starting_node_key = path["starting-node-key"]
 
             # Map the task key corresponding to the beginning of the path to the path itself.
@@ -346,7 +373,7 @@ class RedisProxy(object):
             value_encoded = lst[1]
             # message = lst[1]
             # print("Processing task {} from self.need_to_process...".format(task_key))
-            yield self.process_task(task_key, _value_encoded = value_encoded, print_debug = True) # Could also pass *lst.
+            yield self.process_task(task_key, _value_encoded = value_encoded) # Could also pass *lst.
         # Clear the list.
         self.need_to_process = [] 
 
@@ -378,7 +405,7 @@ class RedisProxy(object):
             
         # For each channel, we create a process and store a reference to it in our list.
         for channel_name in self.redis_channel_names_for_proxy:
-            redis_polling_process = Process(target = self.poll_redis_process, args = (self.redis_polling_queue, channel_name, self.redis_endpoints[0]))
+            redis_polling_process = Process(target = self.poll_redis_process, args = (self.redis_polling_queue, channel_name, self.small_redis_endpoints[0]))
             redis_polling_process.daemon = True 
             self.redis_polling_processes.append(redis_polling_process)
                 
@@ -390,12 +417,10 @@ class RedisProxy(object):
         self.lambda_invoker.start(self.lambda_client, scheduler_address = self.scheduler_address)
 
         # The Scheduler stores its address 
-        self.scheduler_address = yield self.redis_clients[0].get("scheduler-address")
+        self.scheduler_address = yield self.small_redis_clients[0].get("scheduler-address")
 
         payload = {"op": "redis-proxy-channels", "num_channels": len(self.redis_channel_names_for_proxy), "base_name": self.base_channel_name}
         print("Payload for Scheduler: ", payload)
-        # self.scheduler_comm = yield connect_to_address(self.scheduler_address)
-        # self, stream, local_addr, peer_addr
         local_address = "tcp://" + get_stream_address(stream)
         self.scheduler_comm = TCP(stream, local_address, "tcp://" + address[0], deserialize = True)
         print("Writing message to Scheduler...")
@@ -442,7 +467,8 @@ class RedisProxy(object):
 
         try:
             while not closed:
-                print("[ {} ] Message received from address {}. Handling now...".format(datetime.datetime.utcnow(), address))
+                if self.print_debug:
+                    print("[ {} ] Message received from address {}. Handling now...".format(datetime.datetime.utcnow(), address))
                 yield self.deserialize_and_process_message(stream, address = address)
         except (CommClosedError, EnvironmentError) as e:
             io_error = e
@@ -508,11 +534,11 @@ class RedisProxy(object):
                 raise 
                 break
 
-    def get_redis_client(self, task_key):
-        hash_obj = hashlib.md5(task_key.encode())
-        val = int(hash_obj.hexdigest(), 16)
-        idx = val % self.num_redis_clients
-        return self.redis_clients[idx]
+    #def get_redis_client(self, task_key):
+    #    hash_obj = hashlib.md5(task_key.encode())
+    #    val = int(hash_obj.hexdigest(), 16)
+    #    idx = val % self.num_redis_clients
+    #    return self.redis_clients[idx]
 
     def poll_redis_process(self, _queue, redis_channel_name, redis_endpoint):
         ''' This function defines a process which continually polls Redis for messages. 
@@ -550,7 +576,7 @@ class RedisProxy(object):
                 # then we may get messages that are just numbers. 
                 # We ignore these by catching the exception and simply passing.
                 data = data.decode()
-                data = json.loads(data)
+                data = ujson.loads(data)
                 # print("Data: ", data)
                 _queue.put([data])
                 consecutive_misses = 0
@@ -615,15 +641,28 @@ def deserialize_payload(payload):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description='Process some values.')
-    parser.add_argument("-res", "--redis-endpoints", dest="redis_endpoints", nargs = "*", help="Redis endpoint IP addresses", default = ["127.0.0.1"])
-    parser.add_argument("-rps", "--redis-ports", dest="redis_ports", nargs = "*", type=int, default = [6379, 6380])
+    parser.add_argument("-bres", "--big-redis-endpoints", dest="big_redis_endpoints", nargs = "*", help="Redis endpoint IP addresses", default = ["127.0.0.1"])
+    parser.add_argument("-sres", "--small-redis-endpoints", dest="small_redis_endpoints", nargs = "*", help="Redis endpoint IP addresses", default = ["127.0.0.1"])
+    parser.add_argument("-brps", "--big-redis-ports", dest="big_redis_ports", nargs = "*", type=int, default = [6379, 6380])
+    parser.add_argument("-srps", "--small-redis-ports", dest="small_redis_ports", nargs = "*", type=int, default = [6379, 6380])
+    parser.add_argument("-pd", "--print-debug", dest="print_debug", nargs=1, type=bool, default = False)
+    parser.add_argument("-r", "--region", dest="aws_region", nargs=1, default = ["us-east-1"])
     args = vars(parser.parse_args())
-    redis_endpoints = args["redis_endpoints"]
-    redis_ports = args["redis_ports"]
+    big_redis_endpoints = args["big_redis_endpoints"]
+    small_redis_endpoints = args["small_redis_endpoints"]
+    big_redis_ports = args["big_redis_ports"]
+    small_redis_ports = args["small_redis_ports"]
+    print_debug = args["print_debug"]
+    aws_region = args["aws_region"][0]
     # If all the servers are listening on the same port, we can just specify the port once.
-    if len(redis_ports) == 1 and len(redis_endpoints) > 1:
-        redis_ports = redis_ports * len(redis_endpoints)
-    redis_endpoints = list(zip(redis_endpoints, redis_ports))
-    lambda_client = boto3.client('lambda', region_name='us-east-1')
-    proxy = RedisProxy(redis_endpoints, lambda_client)
-    proxy.start()    
+    if len(big_redis_ports) == 1 and len(big_redis_endpoints) > 1:
+        big_redis_ports = big_redis_ports * len(big_redis_endpoints)
+    if len(small_redis_ports) == 1 and len(small_redis_endpoints) > 1:
+        small_redis_ports = small_redis_ports * len(small_redis_endpoints) 
+       
+    big_redis_endpoints = list(zip(big_redis_endpoints, big_redis_ports))
+    small_redis_endpoints = list(zip(small_redis_endpoints, small_redis_ports))
+    print("aws_region: ", aws_region)
+    lambda_client = boto3.client('lambda', region_name=aws_region)
+    proxy = RedisProxy(big_redis_endpoints, small_redis_endpoints, lambda_client, print_debug = print_debug)
+    proxy.start()

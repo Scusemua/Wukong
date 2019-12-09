@@ -12,10 +12,12 @@ from multiprocessing import Process, Pipe
 from .core import CommClosedError
 from .utils import parse_timedelta
 
+import ntplib
 from random import randint
 import boto3
 import datetime
-import json
+#import json
+import ujson
 import time 
 from math import ceil
 
@@ -31,10 +33,8 @@ class BatchedLambdaInvoker(object):
     a myriad of tiny tasks.
     
     """
-
-    # XXX why doesn't BatchedSend follow either the IOStream or Comm API?
-    def __init__(self, interval, use_multiple_invokers = True, function_name="WukongTaskExecutor", num_invokers = 16, redis_channel_names = None, debug_print = False, 
-            chunk_size = 5, loop=None, serializers=None, minimum_tasks_for_multiple_invokers = 8):
+    def __init__(self, interval, use_multiple_invokers = True, function_name="WukongExecutor", num_invokers = 16, redis_channel_names = None, debug_print = False, 
+            chunk_size = 5, loop=None, serializers=None, minimum_tasks_for_multiple_invokers = 8, aws_region = 'us-east-1'):
         # XXX is the loop arg useful?
         self.loop = loop or IOLoop.current()
         self.interval = parse_timedelta(interval, default="ms")
@@ -58,12 +58,14 @@ class BatchedLambdaInvoker(object):
         self.time_spent_invoking = 0
         self.lambda_invokers = []
         self.lambda_pipes = []
+        self.aws_region = aws_region
         self.use_multiple_invokers = use_multiple_invokers 
         self.num_invokers = num_invokers
         self.recent_message_log = deque(
             maxlen=dask.config.get("distributed.comm.recent-messages-log-length")
         )
         self.serializers = serializers
+        #self.ntp_client = ntplib.NTPClient()
 
     def start(self, lambda_client, scheduler_address):
         print("Starting BatchedLambdaInvoker with interval {}...".format(self.interval))
@@ -76,7 +78,7 @@ class BatchedLambdaInvoker(object):
             #(self, conn, chunk_size, scheduler_address, redis_channel_names)
             receiving_conn, sending_conn = Pipe()
             
-            invoker = Process(target = self.invoker_polling_process, args = (i, receiving_conn, self.scheduler_address, self.redis_channel_names,))
+            invoker = Process(target = self.invoker_polling_process, args = (i, receiving_conn, self.scheduler_address, self.redis_channel_names, self.aws_region))
             invoker.daemon = True 
             self.lambda_pipes.append(sending_conn)
             self.lambda_invokers.append(invoker)
@@ -132,10 +134,9 @@ class BatchedLambdaInvoker(object):
             # Send each invoker its respective payload.
             for i in range(1, len(payloads)):
                 sent_time = time.time()
-                #print("Sending payload to invoker process: {}".format(payloads[i]))
                 msg = {"payload": payloads[i], "sent-time": sent_time}
                 conn = self.lambda_pipes[invoker_index]
-                conn.send(json.dumps(msg)) #TODO Can't we just send this without the json.dumps()?
+                conn.send(msg)
                 invoker_index += 1
             try:
                 send_start_time = time.time()
@@ -143,6 +144,10 @@ class BatchedLambdaInvoker(object):
                 total_time_spent_serializing = 0
                 total_time_spent_invoking = 0
                 for payload in scheduler_payload:
+                    # Synchronize time for benchmarking cold starts (and start-times for Lambdas in general).
+                    #remote = self.ntp_client.request("north-america.pool.ntp.org")
+                    #invoke_time = remote.dest_time + remote.offset        
+                    #_payload = {"event": payload, "invoke-time": invoke_time}            
                     time_invoke_start = time.time()
                     self.lambda_client.invoke(FunctionName=self.lambda_function_name, InvocationType='Event', Payload=payload)
                     time_invoke_end = time.time()
@@ -210,17 +215,15 @@ class BatchedLambdaInvoker(object):
         for conn in self.lambda_pipes:
             conn.close()        
 
-    def invoker_polling_process(self, ID, conn, scheduler_address, redis_channel_names):
+    def invoker_polling_process(self, ID, conn, scheduler_address, redis_channel_names, aws_region):
         """ This function runs as a separate process, invoking Lambda functions in parallel.
             
             It continually polls the given Connection object, checking for new payloads. If
             there are no messages in the Pipe, then the process sleeps. The sleep time increases 
             for consecutive empty Pipes."""
         print("[ {} ] - Lambda Invoker Process {} - INFO: Lambda Invoker Process began executing...".format(datetime.datetime.utcnow(), ID))
-        lambda_client = boto3.client('lambda', region_name='us-east-1')
+        lambda_client = boto3.client('lambda', region_name=aws_region)
         current_redis_channel_index = 0
-        #lambda_batch_size = chunk_size                # How many tasks are sent to an individual Lambda function.
-        #lambda_queue = []                            # Messages are put into this queue for processing/invocation.
         expected_messages = None                      # This is how many messages we are expecting to get.
         base_sleep_interval = 0.005                   # The starting sleep interval.
         sleep_interval_increment = 0.005              # We increment the sleep interval by this much for consecutive sleeps.
@@ -233,14 +236,17 @@ class BatchedLambdaInvoker(object):
             if data_available:
                 # Grab the message from the connection.
                 _msg = conn.recv()
-                msg  = json.loads(_msg)
-                sent_time = msg["sent-time"]
-                current_payload = msg["payload"]
+                sent_time = _msg["sent-time"]
+                current_payload = _msg["payload"]
                 received_time = time.time()
                 print("[ {} ] Lambda Invoker Process {} - INFO: Received message from connection. Took {} seconds to transfer through conn.".format(datetime.datetime.utcnow(), ID, received_time - sent_time))
                 num_lambdas_submitted = 0
                 start = time.time()
                 for payload in current_payload:
+                    # Synchronize time for benchmarking cold starts (and start-times for Lambdas in general).
+                    #remote = self.ntp_client.request("north-america.pool.ntp.org")
+                    #invoke_time = remote.dest_time + remote.offset
+                    #_payload = {"event": payload, "invoke-time": invoke_time}
                     lambda_client.invoke(FunctionName=self.lambda_function_name, InvocationType='Event', Payload=payload)
                     num_lambdas_submitted += 1
                 stop = time.time()                
@@ -253,25 +259,4 @@ class BatchedLambdaInvoker(object):
                 current_sleep_interval += sleep_interval_increment
                 # Constrain the sleep interval to the specified max.
                 if current_sleep_interval > max_sleep_interval:
-                    current_sleep_interval = base_sleep_interval 
-
-    def invoker_process(self, payload, chunk_size, scheduler_address, redis_channel_names):
-        """ Invokes Lambdas to execute the tasks contained within the given payload."""
-        lambda_client = boto3.client('lambda', region_name='us-east-1')
-        num_lambdas_submitted = 0
-        # Randomly pick a starting index so certain channels are not necessarily picked more often than others.
-        redis_channel_index = randint(0, (len(redis_channel_names) - 1))
-        start = time.time()
-        # Break up the obtained payload into chunks of size 'chunk_size'
-        chunks = [payload[x : x + chunk_size] for x in range(0, len(payload), chunk_size)]  
-        for chunk in chunks:
-            to_be_serialized = {"task_list": chunk, "scheduler-address": scheduler_address, "redis-channel": redis_channel_names[redis_channel_index]}  
-            serialized_payload = json.dumps(to_be_serialized)
-            lambda_client.invoke(FunctionName=self.lambda_function_name, InvocationType='Event', Payload=serialized_payload)
-            redis_channel_index += 1
-            if redis_channel_index >= len(redis_channel_names):
-                redis_channel_index = 0            
-            num_lambdas_submitted += 1
-        stop = time.time()                
-        time_to_submit = stop - start 
-        print("\n[ {} ] Lambda Invoker Process - INFO: submitted {} Lambdas in {} seconds.".format(datetime.datetime.utcnow(), num_lambdas_submitted, time_to_submit))        
+                    current_sleep_interval = base_sleep_interval      

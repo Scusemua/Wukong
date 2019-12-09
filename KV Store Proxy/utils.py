@@ -4,7 +4,6 @@ import traceback
 import tornado
 from tornado import gen
 from tornado.ioloop import IOLoop
-from contextlib import contextmanager
 import os
 
 msgpack_opts = {
@@ -17,6 +16,19 @@ if sys.version_info[0] == 2:
 if sys.version_info[0] == 3:
    PY3 = True 
    PY2 = False 
+
+def typename(typ):
+    """ Return name of type
+    Examples
+    --------
+    >>> from distributed import Scheduler
+    >>> typename(Scheduler)
+    'distributed.scheduler.Scheduler'
+    """
+    try:
+        return typ.__module__ + "." + typ.__name__
+    except AttributeError:
+        return str(typ)
 
 def has_keyword(func, keyword):
    if PY3:
@@ -44,14 +56,7 @@ def funcname(func):
    try:
       return func.__name__
    except AttributeError:
-      return str(func)      
-
-@contextmanager
-def ignoring(*exceptions):
-   try:
-      yield
-   except exceptions as e:
-      pass   
+      return str(func) 
    
 # TODO: Implement exception handling/reporting (i.e. the following commented-out methods...)   
   
@@ -77,40 +82,4 @@ def get_traceback():
       b in exc_traceback.tb_frame.f_code.co_filename for b in bad
    ):
       exc_traceback = exc_traceback.tb_next
-   return exc_traceback   
-   
-def error_message(e, status="error"):
-   """ Produce message to send back given an exception has occurred
-
-   This does the following:
-
-   1.  Gets the traceback
-   2.  Truncates the exception and the traceback
-   3.  Serializes the exception and traceback or
-   4.  If they can't be serialized send string versions
-   5.  Format a message and return
-
-   See Also
-   --------
-   clean_exception: deserialize and unpack message into exception/traceback
-   six.reraise: raise exception/traceback
-   """
-   tb = get_traceback()
-   e2 = truncate_exception(e, 1000)
-   try:
-      e3 = protocol_pickle_dumps(e2)
-      protocol_pickle_loads(e3)
-   except Exception:
-      e2 = Exception(str(e2))
-   e4 = to_serialize(e2)
-   try:
-      tb2 = protocol_pickle_dumps(tb)
-   except Exception:
-      tb = tb2 = "".join(traceback.format_tb(tb))
-
-   if len(tb2) > 10000:
-      tb_result = None
-   else:
-      tb_result = to_serialize(tb)
-
-   return {"status": status, "exception": e4, "traceback": tb_result, "text": str(e2)}     
+   return exc_traceback     

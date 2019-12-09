@@ -7,6 +7,7 @@ from functools import partial
 import itertools
 import traceback
 import json
+import ujson 
 import logging
 from numbers import Number
 import operator
@@ -18,6 +19,7 @@ import uuid
 import sys
 import hashlib
 import socket
+import numpy as np
 
 import redis 
 from uhashring import HashRing 
@@ -50,7 +52,7 @@ import dask
 import sys, os
 sys.path.insert(0, os.path.abspath('..'))
 from pathing import Path, PathNode
-from lambdag_metrics import TaskExecutionBreakdown, LambdaExecutionBreakdown
+from wukong_metrics import TaskExecutionBreakdown, LambdaExecutionBreakdown
 
 from .protocol import dumps
 from .comm.utils import from_frames
@@ -98,8 +100,26 @@ from .variable import VariableExtension
 
 logger = logging.getLogger(__name__)
 
-lambda_client = boto3.client('lambda', region_name='us-east-1')
 ENCODING = 'utf-8' 
+
+#sqs_client = boto3.client('sqs')
+
+#elasticache_config_endpoint = "dask-cache.fvya82.cfg.use1.cache.amazonaws.com:11211"
+#nodes = elasticache_auto_discovery.discover(elasticache_config_endpoint)
+#nodes = map(lambda x: (x[1], int(x[2])), nodes)
+#memcache_client = HashClient(nodes)
+
+#elasticache_redis_endpoint = "dasl-sl-storage.fvya82.clustercfg.use1.cache.amazonaws.com"
+#elasticache_redis_endpoint = "dask-storage-001.fvya82.0001.use1.cache.amazonaws.com"
+#elasticache_redis_endpoint = "dask-sl-storage.fvya82.ng.0001.use1.cache.amazonaws.com"
+#elasticache_redis_endpoint = "ec2-34-227-191-239.compute-1.amazonaws.com"
+# Passing ignore_subscribe_messages = True will ignore subscribe/unsubscribe confirmation messages.
+#redis_channel = redis_client.pubsub(ignore_subscribe_messages = True) 
+#redis_channel.subscribe("dask-workers")
+
+# We need the number of cores available as this determines how many redis polling processes we will have.
+# num_cores = multiprocessing.cpu_count()
+# num_channels = 1 #int(num_cores * 0.5)
 
 # Create a list to store the channel names.
 redis_channel_names = []
@@ -107,6 +127,11 @@ redis_channel_name_prefix = "dask-workers-"
 
 # The Lambdas are only using one channel now that the Scheduler only gets final results. The channel is hard-coded.
 redis_channel_names.append(redis_channel_name_prefix + "1")
+
+# print("There are {} cores available so we will have {} redis channels.".format(num_cores, num_channels))
+# Create the channel names based on the number of cores available. 
+# for i in range(0, num_channels):
+#     redis_channel_names.append(redis_channel_name_prefix + str(i))
                         
 ALLOWED_FAILURES = dask.config.get("distributed.scheduler.allowed-failures")
 
@@ -877,8 +902,11 @@ class Scheduler(ServerNode):
         dashboard_address=None,
         proxy_address = None,
         proxy_port = None,
-        redis_endpoints = [],
+        big_redis_endpoints = [],
+        small_redis_endpoints = [],
+        storage_threshold = 95000,
         num_lambda_invokers = 16,
+        aws_region = 'us-east-1',
         max_task_fanout = 10,                  # The threshold for when a node will use the proxy to parallelize downstream task invocations.
         chunk_large_tasks = False,             # Flag indicating whether or not Lambda functions should break up large tasks and store them in chunks.
         chunk_task_threshold = 50,             # The threshold, in bytes, above which an object should be broken up into chunks when stored.
@@ -1173,24 +1201,52 @@ class Scheduler(ServerNode):
 
         self.num_lambda_invokers = num_lambda_invokers
 
-        self.redis_endpoints = redis_endpoints
-        self.redis_clients = []
-        self.redis_nodes = dict()
+        self.big_redis_endpoints = big_redis_endpoints
+        self.small_redis_endpoints = small_redis_endpoints
+        self.big_redis_clients = []
+        self.small_redis_clients = []
+        self.big_redis_nodes = dict()
+        self.small_redis_nodes = dict()
+        self.storage_threshold = storage_threshold
+        
+        # Map from task-key --> bool where a value of True indicates that the task has finished execution.
+        # Only used during debugging.
+        self.completed_tasks = defaultdict(bool)
+        
+        # Map from task-key --> bool where a value of True indicates that the task has begun execution on a Lambda.
+        # Only used during debugging.
+        self.executing_tasks = defaultdict(bool)
+
+        self.lambda_debug = False
 
         counter = 1
         # Populate the redis clients as well as the redis nodes for the hash ring.
-        for IP, port in self.redis_endpoints:
+        for IP, port in self.big_redis_endpoints:
             redis_client = redis.StrictRedis(host=IP, port = port, db = 0)
-            self.redis_clients.append(redis_client)
+            self.big_redis_clients.append(redis_client)
             key_string = "node-" + str(IP) + ":" + str(port)
-            self.redis_nodes[key_string] = {
+            self.big_redis_nodes[key_string] = {
                 "hostname": key_string + ".FQDN",
                 "nodename": key_string,
                 "instance": redis_client,
                 "port": port,
-                "vnodes": 40
+                "vnodes": 200
             }
-        self.hash_ring = HashRing(self.redis_nodes)
+
+        for IP, port in self.small_redis_endpoints:
+            redis_client = redis.StrictRedis(host=IP, port = port, db = 0)
+            self.small_redis_clients.append(redis_client)
+            key_string = "node-" + str(IP) + ":" + str(port)
+            self.small_redis_nodes[key_string] = {
+                "hostname": key_string + ".FQDN",
+                "nodename": key_string,
+                "instance": redis_client,
+                "port": port,
+                "vnodes": 200
+            }            
+
+        self.big_hash_ring = HashRing(self.big_redis_nodes, hash_fn='ketama')
+        self.small_hash_ring = HashRing(self.small_redis_nodes, hash_fn='ketama')
         # For each port, create a redis client and store a connection to it.
         #for port in self.redis_ports:
         #    print("[ {} ] Attempting to connect to Redis server {} of {} at {}:{}...".format(datetime.datetime.utcnow(), counter, len(self.redis_ports), self.redis_endpoint, port))
@@ -1199,8 +1255,10 @@ class Scheduler(ServerNode):
         #    self.redis_clients.append(redis_client)
         #    counter = counter + 1
 
-        self.num_redis_clients = len(self.redis_clients)
-
+        self.num_big_redis_instances = len(self.big_redis_clients)
+        self.num_small_redis_instances = len(self.small_redis_clients)
+        self.aws_region = aws_region
+        self.lambda_client = boto3.client('lambda', region_name=self.aws_region)
         # List of timedelta objects representing the difference in time between when a Lambda invocation sent a message to the scheduler
         # and then the scheduler actually received the message.
         self.timedeltas_from_lambda = []                # times that lambda sent msg to when scheduler got it, i think
@@ -1227,6 +1285,11 @@ class Scheduler(ServerNode):
         self.chunk_task_threshold = chunk_task_threshold     # The threshold, in bytes, above which an object should be broken up into chunks when stored.
         self.chunk_large_tasks = chunk_large_tasks # Flag indicating whether or not Lambda functions should break up large tasks and store them in chunks.
         self.num_chunks_for_large_tasks = num_chunks_for_large_tasks
+        self.print_debug = False
+        self.last_job_tasks = list()                # List of task keys/payloads for the last-submitted job.
+        # If we're printing something like a piece of data that could conceivably be 1,000's of characters, we'll probably want to truncate the string representation
+        # of it unless we want to flood the console. This is the point at which we truncate. If it is a negative number, then we don't truncate it.
+        self.print_debug_max_chars = 100    
         if self.worker_ttl:
             pc = PeriodicCallback(self.check_worker_ttl, self.worker_ttl, io_loop=loop)
             self.periodic_callbacks["worker-ttl"] = pc
@@ -1351,14 +1414,21 @@ class Scheduler(ServerNode):
 
             finalize(self, del_scheduler_file)
             
-        self.batched_lambda_invoker = BatchedLambdaInvoker(interval = "2ms", chunk_size = 2, num_invokers = self.num_lambda_invokers, redis_channel_names = redis_channel_names, loop = self.loop)
-        self.batched_lambda_invoker.start(lambda_client, scheduler_address = self.address)        
+        self.batched_lambda_invoker = BatchedLambdaInvoker(interval = "2ms", 
+                                                           chunk_size = 2, 
+                                                           num_invokers = self.num_lambda_invokers, 
+                                                           redis_channel_names = redis_channel_names, 
+                                                           loop = self.loop,
+                                                           aws_region = self.aws_region)
+        self.batched_lambda_invoker.start(self.lambda_client, scheduler_address = self.address)        
         # Write the address to Elasticache so the Lambda function can access it without being told explicitly.
         address_key = "scheduler-address"
         logger.info("Writing value %s to key %s in Redis" % (self.address , address_key))
         print("Writing value {} to key {} in Redis...".format(self.address, address_key))
-        for redis_client in self.redis_clients:
+        for redis_client in self.big_redis_clients:
             redis_client.set(address_key, self.address)
+        for redis_client in self.small_redis_clients:
+            redis_client.set(address_key, self.address)            
         print("Done.")
 
         # Create a list to keep track of the processes as well as the Queue object, which we use for communication between the processes.
@@ -1369,7 +1439,7 @@ class Scheduler(ServerNode):
         print("Creating {} redis-polling processes.".format(len(redis_channel_names)))
         # For each channel, we create a process and store a reference to it in our list.
         for channel_name in redis_channel_names:
-            redis_polling_process = Process(target = self.poll_redis_process, args = (self.redis_polling_queue, channel_name, self.redis_endpoints[0]))
+            redis_polling_process = Process(target = self.poll_redis_process, args = (self.redis_polling_queue, channel_name, self.small_redis_endpoints[0]))
             redis_polling_process.daemon = True 
             self.redis_polling_processes.append(redis_polling_process)
 
@@ -1462,8 +1532,6 @@ class Scheduler(ServerNode):
         self.status = "closed"
         self.stop()
         yield super(Scheduler, self).close()
-
-        redis_channel.unsubscribe()
         
         setproctitle("dask-scheduler [closed]")
         disable_gc_diagnosis()
@@ -1553,8 +1621,7 @@ class Scheduler(ServerNode):
         retries=None,
         user_priority=0,
         actors=None,
-        fifo_timeout=0,
-        print_debug = False
+        fifo_timeout=0
     ):
         """
         Add new computations to the internal dask graph
@@ -1562,6 +1629,11 @@ class Scheduler(ServerNode):
         This happens whenever the Client calls submit, map, get, or compute.
         """
         start = time()
+        print_debug = False
+        try:
+           print_debug = self.print_debug
+        except AttributeError:
+           pass 
         fifo_timeout = parse_timedelta(fifo_timeout)
         keys = set(keys)
         if len(tasks) > 1:
@@ -1614,12 +1686,14 @@ class Scheduler(ServerNode):
                 try:
                     deps = dependencies[key]
                 except KeyError:
-                    deps = self.dependencies[key]
+                    #deps = self.dependencies[key]
+                    deps = dependencies[key]
                 for dep in deps:
                     if dep in dependents:
                         child_deps = dependents[dep]
                     else:
-                        child_deps = self.dependencies[dep]
+                        #child_deps = self.dependencies[dep]
+                        child_deps = dependencies[dep]
                     if all(d in done for d in child_deps):
                         if dep in self.tasks:
                             done.add(dep)
@@ -1789,6 +1863,8 @@ class Scheduler(ServerNode):
         largest_fanout = 0
         largest_fanout_task_key = ""
 
+        self.last_job_tasks.clear() 
+
         # Collect all leaf tasks.
         for task_key, ts in self.tasks.items():
             if len(ts.dependencies) == 0 and (ts.state == "released" or ts.state == "waiting" or ts.state == "no-worker"):
@@ -1872,9 +1948,14 @@ class Scheduler(ServerNode):
 
             current_payload_size = sys.getsizeof(payload_bytes)
             serialized_tasks[current_task.key] = payload_bytes
+
+            if print_debug:
+                print("Size of serialized task payload for task {}: {} bytes".format(current_task.key, current_payload_size))
             
             # Create new path node.
-            current_path_node = PathNode(payload_bytes, payload["key"], current_path, None, None)
+            current_path_node = PathNode(payload_bytes, payload["key"], current_path, None, None, lambda_debug = self.lambda_debug, starts_at = None) # Value for starts_at will be updated later...
+            
+            self.last_job_tasks.append((current_path_node, payload))
 
             tasks_to_path_nodes[current_task.key][current_path.id] = current_path_node
             
@@ -1892,19 +1973,12 @@ class Scheduler(ServerNode):
             
             # If this task has dependencies, then we need to store payload/path and dependency counters in Redis.
             if len(current_task.dependencies) > 0:
-                redis_dep_counter_key = str(ts.key) + "---dep-counter"
+                redis_dep_counter_key = str(current_task.key) + "---dep-counter"
+                if print_debug:
+                    print("Will be storing dependency counter for task {} at key {}".format(current_task.key, redis_dep_counter_key))
                 
-                # Store the payload and the dependency counters for this task state.
-                # hash_obj = hashlib.md5(ts.key.encode())
-                # val = int(hash_obj.hexdigest(), 16)
-                # dict_index = val % self.num_redis_clients
-                # initial_payloads[dict_index][redis_dep_counter_key] = 0
-                associated_redis_client = self.hash_ring.get_node_instance(ts.key)
+                associated_redis_client = self.small_hash_ring.get_node_instance(current_task.key)
                 initial_payloads[associated_redis_client][redis_dep_counter_key] = 0
-                #if val % 2 == 0:
-                #    initial_redis_payload1[redis_dep_counter_key] = 0
-                #else:
-                #    initial_redis_payload2[redis_dep_counter_key] = 0
 
             # If there are no downstream tasks from this node, then just pass.
             if payload["num-dependencies-of-dependents"] == 0:
@@ -2021,6 +2095,7 @@ class Scheduler(ServerNode):
             # Serialize this node. This check is redundant/unnecessary?
             if current_task.key not in tasks_to_serialized_path_node:
                 # Temporarily remove the Path reference before we serialize as we don't want to serialize the path reference.
+                current_path_node.starts_at = current_path.get_start().task_key
                 current_path_node.path = None 
                 node_serialized = cloudpickle.dumps(current_path_node)
                 tasks_to_serialized_path_node[current_task.key] = node_serialized
@@ -2028,6 +2103,9 @@ class Scheduler(ServerNode):
             return current_path_node
         
         visited = dict()
+        metrics = dict()
+        _start_DFS = pythontime.time()
+
         # Construct "paths" by performing depth-first searches from leaves.
         for leaf_task_key, leaf_task_state in leaf_tasks:
             # If the task is processing already, then do not do anything.
@@ -2050,6 +2128,12 @@ class Scheduler(ServerNode):
                 print("[ {} ] - Performing DFS for leaf task {}.".format(datetime.datetime.utcnow(), leaf_task_key))
             DFS(leaf_task_state, new_path, current_path_size, visited, isNewPath = False)
         
+        _DFS_finished = pythontime.time()
+        
+        _DFS_length = _DFS_finished - _start_DFS
+
+        metrics["DFS"] = _DFS_length
+
         # Debug. Print the paths.
         if print_debug:
             counter = 0
@@ -2057,43 +2141,47 @@ class Scheduler(ServerNode):
                 print("\n\nPath #", counter)
                 counter = counter + 1
                 for task in path.tasks:
-                    print(task)
+                    task_str = str(task)
+                    if self.print_debug_max_chars > 0:
+                        task_str = task_str[0:self.print_debug_max_chars] + "..."
+                    print(task_str)
 
         print("\n[ {} ] Number of Paths created: {}.".format(datetime.datetime.utcnow(), len(paths)))
 
         if print_debug:
             print("Serializing path starts...")
 
+        _serialization_start = pythontime.time()
+
         # Serialize all of the paths and store them in Redis.
         serialized_paths = {}
         for task_key, path in tasks_to_path_starts.items():
             nodes = {}
             starting_node_key = path.get_start().task_key
+
             # Store each node in the dictionary under its associated task key. We encode the bytes-form of the nodes so we can send it to Lambda (can't send bytes directly).
             for node in path.tasks:
                 nodes[node.task_key] = base64.encodestring(tasks_to_serialized_path_node[node.task_key]).decode(ENCODING)
                 for invoke_node in node.invoke:
                     nodes[invoke_node] = base64.encodestring(tasks_to_serialized_path_node[invoke_node]).decode(ENCODING)
             payload = {"nodes-map": nodes, "starting-node-key": starting_node_key}
-            serialized_payload = json.dumps(payload)
+            serialized_payload = ujson.dumps(payload)
             serialized_paths[task_key] = serialized_payload
             if print_debug:
-                print("Path beginning at task {} will be stored in Redis.".format(task_key))
+                host = self.big_hash_ring.get_node_hostname(task_key)
+                port = self.big_hash_ring.get_node_port(task_key)
+                print("Path beginning at task {} will be stored in Redis instance listening at {}:{}".format(task_key, host, port))
             path_key = task_key + "---path"
             if print_debug:
                 print("\nLength of Path: ", len(nodes), " tasks")
                 print("Size of Path: ", sys.getsizeof(serialized_payload), " bytes")
+            associated_redis_client = self.big_hash_ring.get_node_instance(task_key)
+            initial_payloads[associated_redis_client][path_key] = serialized_payload  
             
-            #hash_obj = hashlib.md5(task_key.encode())
-            #val = int(hash_obj.hexdigest(), 16)
-            #dict_index = val % self.num_redis_clients
-            #initial_payloads[dict_index][path_key] = serialized_payload
-            associated_redis_client = self.hash_ring.get_node_instance(task_key)
-            initial_payloads[associated_redis_client][path_key] = serialized_payload
-            #if val % 2 == 0:
-            #    initial_redis_payload1[path_key] = serialized_payload
-            #else:
-            #    initial_redis_payload2[path_key] = serialized_payload
+        _serialization_done = pythontime.time()
+        _serialization_length = _serialization_done - _serialization_start
+        
+        metrics["Path-Serialization"] = _serialization_length
 
         print("[ {} ] Done populating payloads. Storing paths in Redis now.".format(datetime.datetime.utcnow()))
 
@@ -2108,10 +2196,17 @@ class Scheduler(ServerNode):
         #        redis_client = self.redis_clients[idx]
         #        redis_client.mset(initial_redis_payload)
         
+        _store_paths_redis_start = pythontime.time()
+
         # Store everything.
         for client, payload in initial_payloads.items():
             if len(payload) > 0:
                 client.mset(payload)
+
+        _store_paths_redis_stop = pythontime.time()
+        _store_paths_redis_length = _store_paths_redis_stop - _store_paths_redis_start
+
+        metrics["Store-Paths-Redis"] = _store_paths_redis_length
 
         #if len(initial_redis_payload1) > 0:
         #    self.redis_client1.mset(initial_redis_payload1)
@@ -2135,14 +2230,21 @@ class Scheduler(ServerNode):
                 path_key = task_key + "---path"
                 print(path_key)
 
+        _invoke_leaf_tasks_start = pythontime.time()
+
         # Invoke all of the leaf tasks.
         for leaf_task_key, leaf_task_state in leaf_tasks:
             payload = serialized_paths[leaf_task_key]
             # We can only send a payload of size 256,000 bytes or less to a Lambda function directly.
             # If the payload is too large, then the Lambda will retrieve it from Redis via the key we provide.
             if sys.getsizeof(payload) > 256000:
-                payload = json.dumps({"path-key": leaf_task_key + "---path"})
+                payload = ujson.dumps({"path-key": leaf_task_key + "---path"})
             self.batched_lambda_invoker.send(payload)
+
+        _invoke_leaf_tasks_stop = pythontime.time()
+        _invoke_leaf_tasks_length = _invoke_leaf_tasks_stop - _invoke_leaf_tasks_start
+
+        metrics["Invoke-Leaf-Tasks"] = _invoke_leaf_tasks_length
 
         print("[ {} ] - Scheduler: all {} leaf node tasks have been submitted to Batched Lambda Invoker for invocation and execution.".format(datetime.datetime.utcnow(), len(leaf_tasks)))
 
@@ -2168,11 +2270,15 @@ class Scheduler(ServerNode):
             if ts.state in ("memory", "erred"):
                 self.report_on_key(ts.key, client=client)
 
-        end = time()
+        end = pythontime.time()
         if self.digests is not None:
             self.digests["update-graph-duration"].add(end - start)
         _now = datetime.datetime.utcnow()
+        print("Number of Tasks: ", len(tasks))
+        print("Number of Leaf Tasks: ", len(leaf_tasks))        
         print("[ {} ] Scheduler - INFO: Update graph duration was {} seconds.".format(_now, end - start))
+        for _label,_length in metrics.items():
+            print("{} took {} seconds...".format(_label, _length))
         # TODO: balance workers
 
     def construct_basic_task_payload(self, task_key, ts):
@@ -2192,7 +2298,8 @@ class Scheduler(ServerNode):
             "proxy-channel": self.redis_channel_names_for_proxy[self.current_redis_proxy_channel_index],
             "chunk-large-tasks": self.chunk_large_tasks,
             "chunk-task-threshold": self.chunk_task_threshold,
-            "num-chunks-for-large-tasks": self.num_chunks_for_large_tasks or -1
+            "num-chunks-for-large-tasks": self.num_chunks_for_large_tasks or -1,
+            "storage_threshold": self.storage_threshold
         }  
 
         # Reset the index if it is now too large.
@@ -2210,6 +2317,12 @@ class Scheduler(ServerNode):
             # If the task is not a dictionary, then it's presumably a serialized object so we just include it directly. The Lambda will deserialize it.
             payload["task"] = task_run_spec
         
+        if self.print_debug:
+            run_spec_str = str(task_run_spec)
+            if self.print_debug_max_chars > 0:
+                run_spec_str = run_spec_str[0:self.print_debug_max_chars] + "..."
+            print("Run Spec for {}: {}".format(task_key, run_spec_str))
+
         return payload 
     
     @gen.coroutine 
@@ -2225,6 +2338,31 @@ class Scheduler(ServerNode):
         if start_handling:
             yield self.handle_stream(comm = self.proxy_comm)
         
+    def flush_data_on_redis_shards(self, asynchronous = True, rewrite_address = True):
+        print("[{}] Flushing all data on Redis shards...".format(datetime.datetime.utcnow()))
+        count = 1
+        for client in self.big_redis_clients:
+            start_flush = pythontime.time()
+            client.flushall(asynchronous = asynchronous)
+            stop_flush = pythontime.time()
+            flush_duration = stop_flush - start_flush
+            print("Flushing data on Big Shard {} took {} seconds...".format(count, flush_duration))
+            count += 1
+        count = 1
+        for client in self.small_redis_clients:
+            start_flush = pythontime.time()
+            client.flushall(asynchronous = asynchronous)
+            stop_flush = pythontime.time()
+            flush_duration = stop_flush - start_flush
+            print("Flushing data on Small Shard {} took {} seconds...".format(count, flush_duration))
+            count += 1            
+        if rewrite_address:
+            for redis_client in self.big_redis_clients:
+                redis_client.set("scheduler-address", self.address)
+            for redis_client in self.small_redis_clients:
+                redis_client.set("scheduler-address", self.address)            
+            print("Done.")          
+          
     def stimulus_task_finished(self, key=None, worker=None, **kwargs):
         """ Mark that a task has finished execution on a particular worker """
         logger.debug("Stimulus task finished %s, %s", key, worker)
@@ -2254,11 +2392,11 @@ class Scheduler(ServerNode):
 
         return recommendations
 
-    def get_redis_client(self, task_key):
-        hash_obj = hashlib.md5(task_key.encode())
-        val = int(hash_obj.hexdigest(), 16)
-        client_index = val % self.num_redis_clients
-        return self.redis_clients[client_index]
+    #def get_redis_client(self, task_key):
+    #    hash_obj = hashlib.md5(task_key.encode())
+    #    val = int(hash_obj.hexdigest(), 16)
+    #    client_index = val % self.num_redis_clients
+    #    return self.redis_clients[client_index]
 
     def stimulus_task_finished_lambda(self, key = None, **kwargs):
         """Mark that a particular task has finished execution on AWS Lambda """
@@ -2279,7 +2417,7 @@ class Scheduler(ServerNode):
             if ts.state == "memory":
                 # assert memcache_client.get(key.replace(" ", "_")) != None 
                 # print("redis_client.get(key): ", redis_client.get(key))
-                assert self.hash_ring[key].exists(key) != 0
+                assert self.small_hash_ring[key].exists(key) != 0 or self.big_hash_ring[key].exists(key) != 0
                 #assert self.get_redis_client(key).exists(key) != 0
         else:
             # print("DEBUG: Received already computed task from AWS Lambda. State {}, Key: {}".format(ts.state, key))
@@ -2761,7 +2899,7 @@ class Scheduler(ServerNode):
             bcomm = BatchedSend(interval="2ms", loop=self.loop)
             bcomm.start(comm)
             self.client_comms[client] = bcomm
-            bcomm.send({"op": "stream-start", "redis_endpoints": self.redis_endpoints})              
+            bcomm.send({"op": "stream-start", "big_redis_endpoints": self.big_redis_endpoints, "small_redis_endpoints": self.small_redis_endpoints})              
             try:
                 yield self.handle_stream(comm=comm, extra={"client": client})
             finally:
@@ -2806,68 +2944,37 @@ class Scheduler(ServerNode):
         )
         self.loop.call_later(cleanup_delay, remove_client_from_events)
 
-    def submit_task_to_lambda(self, key):
-        for line in traceback.format_stack():
-            print(line.strip())    
+    #def submit_task_to_lambda(self, key):
+        #for line in traceback.format_stack():
+        #    print(line.strip())    
         # Debug-related...
         # print("[", str(datetime.datetime.utcnow()), "]   Submitting Task ", key, " to Lambda...")
-        debug_msg = "[" + str(datetime.datetime.utcnow()) + "]   Submitting Task " + key + " to Lambda..."
-        logger.debug(debug_msg)
-        task_state = self.tasks[key]   
-        dependencies = task_state.dependencies
-        timestamp_submitted = str(datetime.datetime.utcnow())
+        #debug_msg = "[" + str(datetime.datetime.utcnow()) + "]   Submitting Task " + key + " to Lambda..."
+        #logger.debug(debug_msg)
+        #task_state = self.tasks[key]   
+        #dependencies = task_state.dependencies
         # TO-DO: Need to check if the result already exists in the Elasticache cluster...
-        payload = {
-            "key": key,
-            "proxy-channel": self.redis_channel_names_for_proxy[self.current_redis_proxy_channel_index],
-            #"nbytes": {dep.key : dep.nbytes for dep in dependencies},
-            "deps": [dep.key for dep in dependencies], # We want the keys as they correspond to entries in the Elasticache.
-            #"duration": self.get_task_duration(task_state),
-            "scheduler-address": self.address,
-            #"submitted-at": timestamp_submitted
-        }
-        self.current_redis_proxy_channel_index += 1
-        if self.current_redis_proxy_channel_index >= self.num_redis_proxy_channels:
-            self.current_redis_proxy_channel_index = 0
-        task = task_state.run_spec
-        if type(task) is dict:
-            payload.update(task)
-        else:
-            payload["task"] = task 
+        #payload = {
+        #    "key": key,
+        #    "proxy-channel": self.redis_channel_names_for_proxy[self.current_redis_proxy_channel_index],
+        #    "deps": [dep.key for dep in dependencies],# We want the keys as they correspond to entries in the Elasticache.
+        #}
+        #self.current_redis_proxy_channel_index += 1
+        #if self.current_redis_proxy_channel_index >= self.num_redis_proxy_channels:
+        #    self.current_redis_proxy_channel_index = 0
+        #task = task_state.run_spec
+        #if type(task) is dict:
+        #    payload.update(task)
+        #else:
+        #    payload["task"] = task 
             #task_deserialized = task.deserialize()
-        temp = list(dumps(payload))
-        payload_bytes = []
-        for bytes_object in temp:
-            payload_bytes.append(base64.encodestring(bytes_object).decode(ENCODING))
-
-        # Check down-stream tasks. 
-        # Make list of down-stream tasks.
-        #   Create 
-        #to_be_serialized = {"task_list": [payload_bytes], "scheduler-address": self.address, "redis-channel": redis_channel_names[self.redis_channel_index]}
-
-        self.batched_lambda_invoker.send(payload_bytes)
-        
-        #serialized = json.dumps(to_be_serialized)
-        #lambda_client.invoke(FunctionName='FunctionExecutor', InvocationType='Event', Payload=serialized)
-        
-        # payload = {"payload": payload_bytes}
-        # JSON only supports unicode strings. Since Base64 can encode bytes to UTF-8 bytes, we can use that codec to decode the data.
-        # serialized_payload = json.dumps(payload)
-        # if self.print_serialized:
-           # print("serialized_payload: ", serialized_payload)
-        # We invoke this as an event so it is asynchronous. We do not grab the response. Instead, the Lambda will inform the scheduler itself.
-        # lambda_client.invoke(FunctionName='FunctionExecutor', InvocationType='Event', Payload=serialized_payload)
-    
-    # def queue_task_for_lambda(self, payload):
-       # queue_size = len(self.lambda_queue)
-       # new_key = "task" + str(queue_size)
-       # self.lambda_queue[new_key] = payload 
-       # if (queue_size + 1) == self.lambda_queue_send_size:
-          # # Send tasks to Lambda 
-          # serialized_payload = json.dumps(self.lambda_queue)
-          # lambda_client.invoke(FunctionName="FunctionExecutor", InvocationType="Event", Payload=serialized_payload)
-          # # Clear the queue.
-          # self.lambda_queue.clear()
+        #payload_serialized = list(dumps(payload))
+        # temp = list(dumps(payload))
+        #payload_bytes = []
+        #for bytes_object in temp:
+        #    payload_bytes.append(base64.encodestring(bytes_object).decode(ENCODING))
+#
+        #self.batched_lambda_invoker.send(payload_serialized)
     
     @gen.coroutine
     def deserialize_payload(self, payload):
@@ -2943,142 +3050,280 @@ class Scheduler(ServerNode):
         #
         # If no messages are found, then the thread will sleep before continuing to poll. 
         while True:
-            #timestamp_before_poll = datetime.datetime.utcnow()
             message = redis_channel.get_message()
-            #timestamp_after_poll = datetime.datetime.utcnow()
-            #time_elapsed = timestamp_after_poll - timestamp_before_poll
             if message is not None:
                 timestamp_now = datetime.datetime.utcnow()
-                # print("[ {} ]  Received message from channel {}.".format(timestamp_now, redis_channel_name))   
                 data = message["data"]
-                # The message should be a "bytes"-like object so we decode it.
-                # If we neglect to turn off the subscribe/unsubscribe confirmation messages,
-                # then we may get messages that are just numbers. 
-                # We ignore these by catching the exception and simply passing.
                 data = data.decode()
-                data = json.loads(data)
-                #time_sent_to_scheduler = data["time_sent_to_scheduler"]
-                #time_sent = datetime.datetime.strptime(time_sent_to_scheduler, "%Y-%m-%d %H:%M:%S.%f")
-                #timestamp_now = datetime.datetime.utcnow()
-                #time_elapsed = timestamp_now - time_sent
-                #_queue.put([data, timestamp_now, time_elapsed])
+                data = ujson.loads(data)
+                if self.print_debug:
+                    print("[ {} ] Received message from AWS Lambda...".format(timestamp_now))
+                    print("\tMessage Contents: " + data)
                 _queue.put([data])
-                # print("_queue.empty() == ", _queue.empty())
-            # else:
-                # Sleep for up to half a second (which would only happen after a large number of misses).
-                # pythontime.sleep(min(10 * num_misses, 100))
                 
     def consume_redis_queue(self):
         ''' This function executes periodically (as a PeriodicCallback on the IO loop). 
         
         It reads messages from the message queue until none are available.'''
-        #print("[ ", datetime.datetime.utcnow(), " ] Executing consume_redis_queue()...")
         messages = []
+
         # 'end' is the time at which we should stop iterating. By default, it is 50ms.
         stop_at = datetime.datetime.utcnow().microsecond + 5000
         while datetime.datetime.utcnow().microsecond < stop_at and len(messages) < 50:
             try:
                 timestamp_now = datetime.datetime.utcnow()
+
                 # Attempt to get a payload from the Queue. A 'payload' consists of a message
                 # and possibly some benchmarking data. The message will be at index 0 of the payload.
                 payload = self.redis_polling_queue.get(block = False, timeout = None)
                 message = payload[0]
-                # This is the time that the process put the message in the queue.
-                #sent_from_process = payload[1]
-                # This is the time it took for the process to get the message from
-                # Redis (after the Lambda put the message in Redis).
-                #lambda_to_process = payload[2]
-                # Calculate how long it took the Scheduler to get the message 
-                # compared to when the process put it in the queue. 
-                #process_to_scheduler = timestamp_now - sent_from_process
-                # Store the benchmark data.
-                #self.times_lambda_to_processes.append(lambda_to_process)
-                #self.times_processes_to_scheduler.append(process_to_scheduler)
                 messages.append(message)
             # In the case that the queue is empty, break out of the loop and process what we already have.
             except queue.Empty:
                 break
-        # Process all of the messages we got from the Queue.
-        #timestamp_now = datetime.datetime.utcnow()
-        #if len(messages) > 0:
-            #print("[ {} ] Processing {} messages from the queue.".format(timestamp_now, len(messages)))
-        # else:
-            # self.num_zero_processed += 1
         for msg in messages:
-            self.result_from_lambda(None, **msg)         
-        # if (len(messages) > 0):
-            # updated = datetime.datetime.utcnow()
-            # print("                               Spent {} seconds processing {} messages.".format(updated - timestamp_now, len(messages)))
-    
-    # def poll_redis_channel(self):
-        # messages = []
-        ##Grab messages one-at-a-time until we have fifty OR there are no more messages.
-        # while(len(messages) < 50):
-            # message = redis_channel.get_message()
-            ##If get_message() returned a message (as opposed to None)...
-            # if message:
-                # data = message["data"]
-                # try:
-                    ##The message should be a "bytes"-like object so we decode it.
-                    ##If we neglect to turn off the subscribe/unsubscribe confirmation messages,
-                    ##then we may get messages that are just numbers. 
-                    ##We ignore these by catching the exception and simply passing.
-                    # data = data.decode()
-                    # data = json.loads(data)
-                    # messages.append(data)
-                # except AttributeError:
-                    # pass 
-            # else:
-                ##If there were no messages, then just break out of 
-                ##the loop and process what we've already retrieved.            
-                # break 
-        # if len(messages) > 0:
-            # logger.debug("Processing {} messages from Redis...".format(len(messages)))
-            # if self.debug_print:
-                # timestamp = str(datetime.datetime.utcnow())
-                # print("[ {} ] Processing {} messages from Redis...".format(timestamp, len(messages)))
-                # print("Messages: ", messages)
-                # print("\n")        
-            # for msg in messages:
-                ##Pass the data to the result_from_lamresult_from_lambda function for processing.
-                # self.result_from_lambda(None, **msg)        
+            self.result_from_lambda(None, **msg)
                
-    def result_from_lambda(self, comm, op, task_key, execution_length = None, **msg):  
-        """ Handle the result from executing a task on AWS Lambda. """
+    def result_from_lambda(self, comm, op, task_key, lambda_id = None, execution_length = None, time_sent = None, **msg):  
+        """ Handle the result from executing a task on AWS Lambda. """   
         self.num_messages_received_from_lambda = self.num_messages_received_from_lambda + 1
-        # if (lambda_length != None):
-            # self.sum_lambda_lengths = self.sum_lambda_lengths + lambda_length
-            # self.lambda_lengths.append(lambda_length)
-        # for message in messages:
-            # task_key = message["task_key"]
-        self.num_results_received_from_lambda = self.num_results_received_from_lambda + 1
         if op == "lambda-result":
-                # timestamp_now = datetime.datetime.utcnow()
-                # timestamp_sent = datetime.datetime.strptime(time_sent_to_scheduler, "%Y-%m-%d %H:%M:%S.%f")
-                # self.task_execution_lengths[task_key] = message["execution_length"]
-                # self.start_end_times[task_key] = [message["start_time"], message["end_time"]]
-                # time_delta = timestamp_now - timestamp_sent
-                # self.timedeltas_from_lambda.append(time_delta)
-            #print("[ {} ] Scheduler - INFO: Received valid result from DAG root-level task node {}.".format(datetime.datetime.utcnow(), task_key))
-            #print("\tOp: {}, Task Key: {}, Execution Length: {}, Msg: {}".format(op, task_key, execution_length, msg))
-            self.obtained_valid_result_from_lambda(task_key = task_key, **msg)
-        elif op == "task-erred":
-            self.handle_task_erred_lambda(key = task_key, exception = message["exception"], traceback = message["traceback"])
+            self.num_results_received_from_lambda = self.num_results_received_from_lambda + 1
+            if self.print_debug == True:
+                print("[ {} ] Received result from Lambda for task {}.".format(datetime.datetime.utcnow(), task_key))
+                print("\tExecution Time: {} seconds".format(execution_length))
+                print("\tTime Sent:", time_sent)
+                print("\tTotal # messages received from Lambda:", self.num_messages_received_from_lambda)                 
+                print("\tTotal # results received from Lambda:", self.num_results_received_from_lambda)
+            self.obtained_valid_result_from_lambda(task_key = task_key, **msg)    
+        elif op == "executing-task":
+            self.executing_tasks[task_key] = True
+            if self.print_debug:
+                print("[DEBUG] Task {} began execution on Lambda {}.".format(task_key, msg['lambda_id']))
+        elif op == "executed_task":
+            # Record that we've completed the task.
+            self.completed_tasks[task_key] = True
+            self.executing_tasks[task_key] = False
+            if self.print_debug:
+                print("[DEBUG] Task {} has been executed successfully by Lambda {}.\n\tStart Time: {}\n\tStop Time: {}\n\tExecution Time: {} seconds".format(task_key,
+                                                                                                                                                msg['lambda_id'],
+                                                                                                                                                msg['start_time'],
+                                                                                                                                                msg['stop_time'],
+                                                                                                                                                msg['execution_time']))
         else:
-            print("ERROR: Unknown operation for result from lambda: {}".format(message["op"]))               
+            raise ValueError("Unknown operation '{}' included in message from Lambda {}".format(op, lambda_id))
          
-    def get_lambdag_metrics(self):
-        task_metrics = self.redis_clients[0].lrange("task_breakdowns", 0, -1)
-        lambda_metrics = self.redis_clients[0].lrange("lambda_durations", 0, -1)
+    def get_wukong_metrics(self):
+        task_metrics = self.small_redis_clients[0].lrange("task_breakdowns", 0, -1)
+        lambda_metrics = self.small_redis_clients[0].lrange("lambda_durations", 0, -1)
 
         task_metrics = [cloudpickle.loads(res) for res in task_metrics]
         lambda_metrics = [cloudpickle.loads(res) for res in lambda_metrics]
 
         return {"task-metrics": task_metrics, "lambda-metrics": lambda_metrics}
     
-    def reset_lambdag_metrics(self):
-        self.redis_clients[0].delete("task_breakdowns")
-        self.redis_clients[0].delete("lambda_durations")
+    def small_redis_statistics(self, n = 1000000):
+        units = ""
+        if n == 1:
+            units = "bytes"
+        elif n == 1000:
+            units = "KB"
+        elif n == 1000000:
+            units = "MB"
+        elif n == 1000000000:
+            units = "GB"
+        elif n == 1000000000000:
+            units = "TB"
+        else:
+            raise  ValueError("Improper value for n")
+            
+        small_clients_memory_usage = []
+        total_commands = []
+        total_connections = []
+        small_infos = []
+        command_stats = dict()
+        command_stat_keys = ["cmdstat_info", "cmdstat_exists", "cmdstat_flushall", "cmdstat_mget", "cmdstat_get", "cmdstat_mset", "cmdstat_set"]
+        command_stats_formatted = dict()
+        counter = 1
+
+        for client in self.small_redis_clients:
+            data = client.info()
+            cmd_data = client.info("commandstats")
+            command_stats[counter] = cmd_data
+            small_infos.append(data)
+            small_clients_memory_usage.append(data["used_memory"] / n)   
+            total_connections.append(data["total_connections_received"])
+            total_commands.append(data["total_commands_processed"])
+            line_str = ""
+            for key in command_stat_keys:
+                if key in cmd_data:
+                    line_str = line_str + str(cmd_data[key]['calls']) + ","
+                else:
+                    line_str = line_str + "0,"
+            command_stats_formatted[counter] = line_str
+            counter = counter + 1        
+
+        
+        x1 = np.array(small_clients_memory_usage)
+        x2 = np.array(total_commands)
+        x3 = np.array(total_connections)
+
+        return ({"varience of mem used": str(np.var(x1)) + units + "^2", 
+                "standard-deviation of mem used": str(np.std(x1)) + units, 
+                "mean mem used": str(np.mean(x1)) + units,
+                "min mem used": str(np.min(x1)) + units,
+                "max mem used": str(np.max(x1)) + units,
+                "range mem used": str(np.max(x1) - np.min(x1)) + units,
+                "avg conn received": str(np.mean(x3)) + " connections",
+                "min conn received": str(np.min(x3)) + " connections",
+                "max conn received": str(np.max(x3)) + " connections",
+                "avg commands executed": str(np.mean(x2)) + " commands",
+                "min commands executed": str(np.min(x2)) + " commands",
+                "max commands executed": str(np.max(x2)) + " commands"}, small_clients_memory_usage, command_stats_formatted, command_stats)
+
+    def check_status_of_task_debug(self, task_key, print_all = False):
+        """ Check the status of an individual task. 
+
+            print_all :: bool : If True, this will recursively print all dependencies of all waiting tasks, not just the task specified by 'task_key'.
+            
+            If a value for 'max_layers' is given, then this will only print dependencies for that many layers deep."""
+        if (not self.lambda_debug):
+            raise RuntimeError("Lambda Debugging is not enabled. Cannot retrieve debug information.")
+        
+        if self.executing_tasks[task_key] == True:
+            return "Task {} is currently executing.".format(task_key)
+        elif self.completed_tasks[task_key] == True:
+            return "Task {} finished executing.".format(task_key)
+        else:
+            # TODO: Iterate over dependencies, check which are done and which aren't done. Return this information to user.
+            return_msg = "Task {} has not started executing yet.".format(task_key)
+            ts = self.tasks[task_key]
+            dependencies = ts.dependencies
+            for task_state in dependencies:
+                dependency_key = task_state.key
+                if self.executing_tasks[dependency_key] == True:
+                    return_msg = return_msg + "\t\n{} - EXECUTION IN PROGRESS".format(dependency_key)
+                elif self.completed_tasks[dependency_key] == True:
+                    return_msg = return_msg + "\t\n{} - COMPLETED".format(dependency_key)
+                else:
+                    return_msg = return_msg + "\t\n{} - WAITING".format(dependency_key)
+                    if (print_all):
+                        raise NotImplementedError("Haven't implemented print_all feature yet.")
+            return return_msg
+        
+
+    def check_status_of_tasks(self):
+        """ Checks which tasks from the last-submitted job are done and which are not done.
+
+            For the tasks that are not done, this also returns how many of their dependencies have been resolved."""
+        print("[SCHEDULER] Checking status of last job. Need to check {} tasks.".format(len(self.last_job_tasks)))
+        # Get current timestamp.
+        _now = datetime.datetime.utcnow()        
+        
+        complete = list()
+        incomplete = list()
+        waiting_on = dict()
+
+        for task_node, payload in self.last_job_tasks:
+            task_key = task_node.task_key 
+            val = self.big_hash_ring[task_key].exists(task_key)
+            if val == 0:
+                val = self.small_hash_ring[task_key].exists(task_key)
+                if val == 0:
+                    # Remove the function/args entries as they will just be serialized nonsense.
+                    _payload = payload.copy()
+                    _payload["function"] = None
+                    _payload["args"] = None                    
+                    incomplete.append((task_node, _payload))
+                    dep_counter = task_key + "---dep-counter"
+                    remaining = self.small_hash_ring[task_key].get(dep_counter).decode()
+                    total = len(payload["dependencies"])
+                    waiting_on[task_key] = (remaining, total)
+                else:
+                    # Remove the function/args entries as they will just be serialized nonsense.
+                    _payload = payload.copy()
+                    _payload["function"] = None
+                    _payload["args"] = None
+                    complete.append((task_node, _payload))
+            else:
+                # Remove the function/args entries as they will just be serialized nonsense.
+                _payload = payload.copy()
+                _payload["function"] = None
+                _payload["args"] = None                
+                complete.append((task_node, _payload))
+        
+        print("[SCHEDULER] {}/{} of the tasks in the last workload have finished executing.".format(len(complete), len(self.last_job_tasks)))
+        return {
+            "completed-tasks": complete,
+            "incomplete-tasks": incomplete,
+            "dependency-counter-values": waiting_on
+        }
+
+    def big_redis_statistics(self, n = 1000000):
+        units = ""
+        if n == 1:
+            units = "bytes"
+        elif n == 1000:
+            units = "KB"
+        elif n == 1000000:
+            units = "MB"
+        elif n == 1000000000:
+            units = "GB"
+        elif n == 1000000000000:
+            units = "TB"
+        else:
+            raise  ValueError("Improper value for n")
+
+        big_clients_memory_usage = []
+        big_infos = []
+        total_commands = []
+        total_connections = []        
+        command_stats = dict()
+        command_stat_keys = ["cmdstat_info", "cmdstat_exists", "cmdstat_flushall", 
+                                "cmdstat_mget", "cmdstat_get", "cmdstat_mset", "cmdstat_set", 
+                                    "cmdstat_lpush", "cmdstat_subscribe", "cmdstat_incrby", "cmdstat_publish"]
+        command_stats_formatted = dict()
+        counter = 1
+
+        command_stats_formatted["keys"] = "'cmdstat_info', 'cmdstat_exists', 'cmdstat_flushall', 'cmdstat_mget', 'cmdstat_get', 'cmdstat_mset', 'cmdstat_set', 'cmdstat_lpush', 'cmdstat_subscribe', 'cmdstat_incrby', 'cmdstat_publish'"
+
+        for client in self.big_redis_clients:
+            data = client.info()
+            cmd_data = client.info("commandstats")
+            command_stats[counter] = cmd_data
+            big_infos.append(data)
+            big_clients_memory_usage.append(data["used_memory"] / n)
+            total_connections.append(data["total_connections_received"])
+            total_commands.append(data["total_commands_processed"])  
+            line_str = ""
+            for key in command_stat_keys:
+                if key in cmd_data:
+                    line_str = line_str + str(cmd_data[key]['calls']) + ","
+                else:
+                    line_str = line_str + "0,"
+            command_stats_formatted[counter] = line_str
+            counter = counter + 1                        
+        
+        x1 = np.array(big_clients_memory_usage)
+        x2 = np.array(total_commands)
+        x3 = np.array(total_connections)
+
+        return ({"varience of mem used": str(np.var(x1)) + units + "^2",  
+                "standard-deviation of mem used": str(np.std(x1)) + units, 
+                "mean mem used": str(np.mean(x1)) + units,
+                "min mem used": str(np.min(x1)) + units,
+                "max mem used": str(np.max(x1)) + units,
+                "range mem used": str(np.max(x1) - np.min(x1)) + units,
+                "avg conn received": str(np.mean(x3)) + " connections",
+                "min conn received": str(np.min(x3)) + " connections",
+                "max conn received": str(np.max(x3)) + " connections",
+                "avg commands executed": str(np.mean(x2)) + " commands",
+                "min commands executed": str(np.min(x2)) + " commands",
+                "max commands executed": str(np.max(x2)) + " commands"}, big_clients_memory_usage, command_stats_formatted, command_stats)     
+
+    def reset_wukong_metrics(self):
+        self.small_redis_clients[0].delete("task_breakdowns")
+        self.small_redis_clients[0].delete("lambda_durations")
         return True 
 
     @gen.coroutine 
@@ -3121,19 +3366,6 @@ class Scheduler(ServerNode):
         """ Print a message received from some remote object (probably AWS Lambda) """
         timestamp_now = datetime.datetime.utcnow()
         print("[{}]    {}".format(timestamp_now, message))
-
-    ##def print_lambda_diagnostic_info(self):
-    ##    if self.batched_lambda_invoker.total_lambdas_invoked == 0:
-    ##        return 
-    ##    timestamp_now = datetime.datetime.utcnow()
-    ##    keys_in_elasticache = self.redis_client1.dbsize() + self.redis_client2.dbsize()
-    ##    num_sent = self.redis_client1.get("num-sent").decode('utf-8') + self.redis_client2.get("num-sent").decode('utf-8')
-    ##    print("[{}] Lambda Debug Information:".format(timestamp_now))
-    ##    print("   Number of Keys in Elasticache: ", keys_in_elasticache)
-    ##    print("   Number of Lambdas Invoked: ", self.batched_lambda_invoker.total_lambdas_invoked)
-    ##    print("   Number of Messages Sent by Lambda: ", num_sent)
-    ##    print("   Number of Messages Received from Lambda: ", self.num_messages_received_from_lambda)
-    ##    print("      Difference: ", str(int(num_sent) - self.num_messages_received_from_lambda), "\n")
         
     def obtained_valid_result_from_lambda(self, task_key, **msg):
         validate_key(task_key)
@@ -4527,7 +4759,7 @@ class Scheduler(ServerNode):
 
             # Do both for now... eventually workers won't be involved.
             # self.send_task_to_worker(worker, key)
-            self.submit_task_to_lambda(key)
+            #self.submit_task_to_lambda(key)
             
             return {}
         except Exception as e:
@@ -5010,7 +5242,8 @@ class Scheduler(ServerNode):
                 #    ts.waiting_on.add(dts)
                 #if self.get_redis_client(dts.key).exists(dts.key) == 0:
                 #    ts.waiting_on.add(dts)
-                if self.hash_ring[dts.key].exists(dts.key) == 0:
+                # Check both the big and small hash rings.
+                if self.big_hash_ring[dts.key].exists(dts.key) == 0 and self.small_hash_ring[dts.key].exists(dts.key) == 0:
                     ts.waiting_on.add(dts)
                 if dts.state == "released":
                     recommendations[dep] = "waiting"
@@ -5061,7 +5294,7 @@ class Scheduler(ServerNode):
                     # ts.waiting_on.add(dts)        
                 #if self.get_redis_client(dts.key).exists(dts.key) == 0:
                 #    ts.waiting_on.add(dts)     
-                if self.hash_ring[dts.key].exists(dts.key) == 0:
+                if self.big_hash_ring[dts.key].exists(dts.key) == 0 and self.small_hash_ring[dts.key].exists(dts.key) == 0:
                     ts.waiting_on.add(dts)
                 # if not dts.who_has:
                     # ts.waiting_on.add(dep)

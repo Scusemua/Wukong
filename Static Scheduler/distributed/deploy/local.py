@@ -114,12 +114,15 @@ class LocalCluster(SpecCluster):
         worker_class=None,
         proxy_address = None,
         proxy_port = None,
-        redis_endpoints = [],
+        big_redis_endpoints = [],
+        small_redis_endpoints = [],
         num_lambda_invokers = 16,
         max_task_fanout = 10,
         chunk_large_tasks = False,
         chunk_task_threshold = 50,
+        storage_threshold = 95000,
         num_chunks_for_large_tasks = None,
+        aws_region = 'us-east-1',
         **worker_kwargs
     ):
         if ip is not None:
@@ -193,12 +196,15 @@ class LocalCluster(SpecCluster):
                 blocked_handlers=blocked_handlers,
                 proxy_address = proxy_address,
                 proxy_port = proxy_port,
-                redis_endpoints = redis_endpoints, 
+                big_redis_endpoints = big_redis_endpoints, 
+                small_redis_endpoints = small_redis_endpoints,
                 num_lambda_invokers = num_lambda_invokers,
                 chunk_large_tasks = chunk_large_tasks,
                 chunk_task_threshold = chunk_task_threshold,
                 max_task_fanout = max_task_fanout,
-                num_chunks_for_large_tasks = num_chunks_for_large_tasks
+                num_chunks_for_large_tasks = num_chunks_for_large_tasks,
+                storage_threshold = storage_threshold,
+                aws_region = aws_region
             ),
         }
 

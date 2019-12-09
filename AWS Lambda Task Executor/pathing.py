@@ -29,7 +29,7 @@ class Path(object):
         """Overrides the default implementation of equals."""
         if isinstance(value, Path):
             return self.id == value.id 
-        return false 
+        return False 
 
     def get_start(self):
         """ Return the beginning of the path, or None if the path is empty."""
@@ -77,15 +77,18 @@ class PathNode(object):
             task_payload   - Dictionary: Contains information about the task required for execution (code, dependencies, dependents, etc.) 
             task_key       - String:     The unique identifier for the task associated with this node (also contained within 'task_payload' under "key")
             invoke         - [PathNode]: List of keys of PathNode objects that should be invoked (assuming dependencies are available) when this node finishes execution.
-            become         - PathNode:   The key of the PathNode object that should be executed on the same Lambda as this one, once this node finishes execution. 
+            become         - String:     The key of the PathNode object that should be executed on the same Lambda as this one, once this node finishes execution. 
+            starts_at      - String:     The key of the PathNode/task located at the beginning of the path on which this node is located.
         """
-    def __init__(self, task_payload, task_key, path, invoke, become, use_proxy = False):
+    def __init__(self, task_payload, task_key, path, invoke, become, lambda_debug = False, use_proxy = False, starts_at = None):
         self.task_payload = task_payload or None
         self.task_key = task_key
         self.invoke = invoke or []
         self.path = path 
         self.become = become or None 
         self.use_proxy = use_proxy
+        self.starts_at = None
+        self.lambda_debug = lambda_debug
 
     def add_downstream_task(self, node):
         """Add a downstream task to either the 'invoke' list or as the 'become' node. 
@@ -107,6 +110,21 @@ class PathNode(object):
     def get_task_key(self):
         return self.task_key
 
+    def num_downstream_tasks(self):
+       num_tasks = 0
+       if self.become is not None:
+          num_tasks += 1
+       num_tasks += len(self.invoke)
+       return num_tasks 
+    
+    def get_downstream_tasks(self):
+       """Return a list containing all downstream tasks of this node (which includes the 'become' node and any 'invoke' nodes)."""
+       downstream_tasks = [] 
+       if self.become is not None:
+          downstream_tasks.append(self.become)
+       downstream_tasks.extend(self.invoke)
+       return downstream_tasks
+
     def __eq__(self, value):
         """Overrides the default implementation"""
         if isinstance(value, PathNode):
@@ -121,5 +139,5 @@ class PathNode(object):
             invoke_str = invoke_str + "PathNode for Task " + key + ", "
         if self.become is not None:
             become_str = become_str + "PathNode for Task " + self.become + ", "
-        str = "[PathNode]\nTask State (key): {}\n\t\tInvoke: [{}]\n\t\tBecome: [{}]".format(self.get_task_key(), invoke_str, become_str)
+        str = "[PathNode]\nTask State (key): {}\n\t\tTask Payload: {}\n\t\tInvoke: [{}]\n\t\tBecome: [{}]".format(self.get_task_key(), self.task_payload, invoke_str, become_str)
         return str 

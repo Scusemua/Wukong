@@ -8,8 +8,10 @@ from multiprocessing import Process, Pipe
 
 from random import randint
 import boto3
+import ntplib
 import datetime
 import json
+import ujson
 import time 
 from numbers import Number 
 import datetime
@@ -57,7 +59,8 @@ class ProxyLambdaInvoker(object):
     # RedisPartitioningDaskExecutor
     # ProxyPubSubDaskExecutor
     # RedisMultipleVMsExecutor
-    def __init__(self, interval = "5ms", use_multiple_invokers = True, function_name="RedisMultipleVMsExecutor", num_invokers = 8, redis_channel_names = None, debug_print = False, 
+    # WukongExecutor
+    def __init__(self, interval = "5ms", use_multiple_invokers = True, function_name="WukongExecutor", num_invokers = 8, redis_channel_names = None, debug_print = False, 
             chunk_size = 5, loop=None, serializers=None, minimum_tasks_for_multiple_invokers = 8, redis_channel_names_for_proxy = None):
         # XXX is the loop arg useful?
         self.loop = loop or IOLoop.current()
@@ -87,6 +90,7 @@ class ProxyLambdaInvoker(object):
         self.use_multiple_invokers = use_multiple_invokers 
         self.num_invokers = num_invokers
         self.serializers = serializers
+        #self.ntp_client = ntplib.NTPClient()
         
     def start(self, lambda_client, scheduler_address):
         print("Starting BatchedLambdaInvoker with interval {}...".format(self.interval))
@@ -153,7 +157,7 @@ class ProxyLambdaInvoker(object):
                 sent_time = time.time()
                 msg = {"payload": payloads[i], "sent-time": sent_time}
                 conn = self.lambda_pipes[invoker_index]
-                conn.send(json.dumps(msg)) #TODO Can't we just send this without the json.dumps()?
+                conn.send(ujson.dumps(msg)) #TODO Can't we just send this without the json.dumps()?
                 invoker_index += 1
             try:
                 # send_start_time = time.time()
@@ -163,7 +167,10 @@ class ProxyLambdaInvoker(object):
                 # total_time_spent_invoking = 0
                 for payload in scheduler_payload:
                     # time_invoke_start = time.time()
-                    self.lambda_client.invoke(FunctionName=self.lambda_function_name, InvocationType='Event', Payload=payload)
+                    #remote = self.ntp_client.request("north-america.pool.ntp.org")
+                    #invoke_time = remote.dest_time + remote.offset        
+                    #_payload = {"event": payload, "invoke-time": invoke_time}
+                    self.lambda_client.invoke(FunctionName=self.lambda_function_name, InvocationType='Event', Payload = payload)
                     # time_invoke_end = time.time()
                     # diff_invoke = time_invoke_end - time_invoke_start
                     # total_time_spent_invoking += diff_invoke 
@@ -181,7 +188,7 @@ class ProxyLambdaInvoker(object):
                 # print("                               Total Lambdas Invoked: {}. Total # Tasks Invoked: {}".format(self.total_lambdas_invoked, self.num_tasks_invoked))
                 # print("                               The Proxy has spent {} seconds calling invoke() so far.".format(self.time_spent_invoking))
             except Exception:
-                logger.exception("Error in batched write")
+                #logger.exception("Error in batched write")
                 print("Error in batched write.")
                 break
             finally:
@@ -259,7 +266,7 @@ class ProxyLambdaInvoker(object):
             if data_available:
                 # Grab the message from the connection.
                 _msg = conn.recv()
-                msg  = json.loads(_msg)
+                msg  = ujson.loads(_msg)
                 sent_time = msg["sent-time"]
                 current_payload = msg["payload"]
                 received_time = time.time()
@@ -267,7 +274,10 @@ class ProxyLambdaInvoker(object):
                 num_lambdas_submitted = 0
                 start = time.time()
                 for payload in current_payload:
-                    lambda_client.invoke(FunctionName=self.lambda_function_name, InvocationType='Event', Payload=payload)
+                    #remote = self.ntp_client.request("north-america.pool.ntp.org")
+                    #invoke_time = remote.dest_time + remote.offset        
+                    #_payload = {"event": payload, "invoke-time": invoke_time}                    
+                    lambda_client.invoke(FunctionName=self.lambda_function_name, InvocationType='Event', Payload = payload)
                     num_lambdas_submitted += 1
                 stop = time.time()                
                 time_to_submit = stop - start 

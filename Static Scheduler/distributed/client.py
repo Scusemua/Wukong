@@ -1061,7 +1061,7 @@ class Client(Node):
         assert len(msg) == 1
         assert msg[0]["op"] == "stream-start"
 
-        self._handle_redis_info(msg[0]["redis_endpoints"])
+        self._handle_redis_info(msg[0]["big_redis_endpoints"], msg[0]["small_redis_endpoints"])
 
         bcomm = BatchedSend(interval="10ms", loop=self.loop)
         bcomm.start(comm)
@@ -1233,28 +1233,45 @@ class Client(Node):
         logger.warning("Scheduler exception:")
         logger.exception(exception)
 
-    def _handle_redis_info(self, redis_endpoints):
+    def _handle_redis_info(self, big_redis_endpoints, small_redis_endpoints):
         print("Client received redis info from Scheduler.")
-        self.redis_endpoints = redis_endpoints
-        self.redis_nodes = dict()
-        self.redis_clients = []
+        self.big_redis_endpoints = big_redis_endpoints
+        self.small_redis_endpoints = small_redis_endpoints
+        self.big_redis_nodes = dict()
+        self.small_redis_nodes = dict()
+        self.big_redis_clients = []
+        self.small_redis_clients = []
         # Populate the redis clients as well as the redis nodes for the hash ring.
-        for IP, port in self.redis_endpoints:
+        for IP, port in self.big_redis_endpoints:
             redis_client = redis.StrictRedis(host=IP, port = port, db = 0)
-            self.redis_clients.append(redis_client)
+            self.big_redis_clients.append(redis_client)
             key_string = "node-" + str(IP) + ":" + str(port)
-            self.redis_nodes[key_string] = {
+            self.big_redis_nodes[key_string] = {
                 "hostname": key_string + ".FQDN",
                 "nodename": key_string,
                 "instance": redis_client,
                 "port": port,
-                "vnodes": 40
+                "vnodes": 200
             }
-        self.hash_ring = HashRing(self.redis_nodes)
+
+        for IP, port in self.small_redis_endpoints:
+            redis_client = redis.StrictRedis(host=IP, port = port, db = 0)
+            self.small_redis_clients.append(redis_client)
+            key_string = "node-" + str(IP) + ":" + str(port)
+            self.small_redis_nodes[key_string] = {
+                "hostname": key_string + ".FQDN",
+                "nodename": key_string,
+                "instance": redis_client,
+                "port": port,
+                "vnodes": 200
+            }
+
+        self.big_hash_ring = HashRing(self.big_redis_nodes, hash_fn = "ketama")
+        self.small_hash_ring = HashRing(self.small_redis_nodes, hash_fn = "ketama")
         #for port in self.redis_ports:
         #    client = redis.StrictRedis(host=self.redis_endpoint, port = port, db = 0)      
         #    self.redis_clients.append(client)
-        self.num_redis_clients = len(self.redis_clients)    
+        #self.num_redis_clients = len(self.redis_clients)    
 
     @gen.coroutine
     def _close(self, fast=False):
@@ -1780,7 +1797,7 @@ class Client(Node):
         # For each key, append it to the list associated with its client.
         # We then call client.mget(list) for each of these lists to retrieve the results.
         for key in keys:
-            client = self.hash_ring.get_node_instance(key)
+            client = self.big_hash_ring.get_node_instance(key)
             redis_key_lists[client].append(key)
 
         # Get the results and zip them with the keys so each key is paired with its associated value.
@@ -1796,7 +1813,7 @@ class Client(Node):
                 deserialized_value = cloudpickle.loads(value)
                 data[key] = deserialized_value
             else:
-                addr = self.hash_ring.get_node_hostname(key)
+                addr = self.big_hash_ring.get_node_hostname(key)
                 print("[ERROR] Failed to retrieve value for task {} from Redis instance listening at addr {}".format(key, addr))
                 missing_keys.add(key)
 
@@ -2812,6 +2829,9 @@ class Client(Node):
         #    collections, workers, allow_other_workers
         #)
 
+        restrictions = {}
+        loose_restrictions = []
+
         if not isinstance(priority, Number):
             priority = {k: p for c, p in priority.items() for k in self._expand_key(c)}
 
@@ -2922,10 +2942,13 @@ class Client(Node):
 
         names = {k for c in collections for k in flatten(c.__dask_keys__())}
 
-        restrictions, loose_restrictions = self.get_restrictions(
-            collections, workers, allow_other_workers
-        )
-
+        #restrictions, loose_restrictions = self.get_restrictions(
+        #    collections, workers, allow_other_workers
+        #)
+        
+        restrictions = {}
+        loose_restrictions = []
+        
         if not isinstance(priority, Number):
             priority = {k: p for c, p in priority.items() for k in self._expand_key(c)}
 
