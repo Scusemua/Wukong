@@ -49,10 +49,12 @@ The Scheduler listens for results from Lambda using a "Subscriber Process", whic
 
 ### The KV Store Proxy
 
+This component is used to parallelize Lambda function invocations in the middle of a workload's execution.
 ...
 
 ### The AWS Lambda Task Executor
 
+The Task Executors are responsible for executing tasks and performing dynamic scheduling. 
 ...
 
 ### Developer Setup Notes
