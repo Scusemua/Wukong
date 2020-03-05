@@ -33,7 +33,7 @@ If you encounter any issues understanding or running this version of Wukong, ple
 
 Wukong is a serverless DAG scheduler attuned to AWS Lambda. Wukong provides decentralized scheduling using a combination of static and dynamic scheduling. Wukong supports general Python data analytics workloads. 
 
-![Architecture](https://i.imgur.com/nZb3qas.png "Wukong's Architecture")
+![Architecture](https://i.imgur.com/TSHldjg.png "Wukong's Architecture")
 
 ## Code Overview/Explanation 
 
@@ -85,9 +85,6 @@ LocalCluster(object):
     The public DNS IPv4 address associated with the EC2 instance on which the KV Store Proxy process is executing.
   proxy_port : 8989,
     The port on which the KV Store Proxy process is listening.
-  redis_endpoints : list of tuples of the form (string, int)
-    List of the public DNS IPv4 addresses and ports on which KV Store (Redis) instances are listening. The format
-    of this list should be [("IP_1", port_1), ("IP_2", port_2), ..., ("IP_n", port_n)] 
   num_lambda_invokers : int
     This value specifies how many 'Initial Task Executor Invokers' should be created by the Scheduler. The 'Initial Task 
     Executor Invokers' are processes that are used by the Scheduler to parallelize the invocation of Task Executors
@@ -97,7 +94,7 @@ LocalCluster(object):
     task invocation. The principle here is the same as with the initial task invokers. Our tests found that invoking Lambda functions
     takes about 50ms on average. As a result, if a given Task T has a large fanout (i.e., there are a large number of downstream tasks 
     directly dependent on T), then it may be advantageous to parallelize the invocation of these downstream tasks.
-  chunk_task_threshold : int
+  big_task_threshold : int
     The threshold (in bytes) for determining whether or not to execute downstream tasks locally. More specifically, if the intermediate
     output data of a task is greater than or equal to 'chunk_task_threshold', then the Task Executor will attempt to execute the task's
     downstream tasks locally. This limits the amount of large-object network communication that has to occur, thereby speeding up the
@@ -108,20 +105,19 @@ LocalCluster(object):
 ```python
 import dask.array as da
 from distributed import LocalCluster, Client
-lc = LocalCluster(host='ec2-3-16-83-131.us-east-2.compute.amazonaws.com:8786',
-                  proxy_address = 'ec2-3-133-154-219.us-east-2.compute.amazonaws.com',
-                  big_redis_endpoints = [('ec2-3-21-228-179.us-east-2.compute.amazonaws.com', 6379),
-                                         ('ec2-66-112-34-62.us-east-2.compute.amazonaws.com', 6379),
-                                         ('ec2-240-186-137-25.us-east-2.compute.amazonaws.com', 6379),
-                                         ('ec2-39-204-234-155.us-east-2.compute.amazonaws.com', 6379)],
-                  small_redis_endpoints = [('ec2-18-191-192-13.us-east-2.compute.amazonaws.com', 6379),
-                                           ('ec2-18-224-33-31.us-east-2.compute.amazonaws.com', 6379)],
+lc = LocalCluster(host='ec2-XX-XX-XXX-X.compute-1.amazonaws.com:8786',
+                  proxy_address = 'ec2-XX-XXX-X-XXX.compute-1.amazonaws.com',
                   n_workers = 0,
                   proxy_port = 8989,
                   num_lambda_invokers = 30,
-                  chunk_task_threshold = 10000000,
-                  max_task_fanout = 30,
-                  aws_region = "us-east-2") 
+                  chunk_large_tasks = False,
+                  big_task_threshold = 200_000_000,
+                  max_task_fanout = 330,
+                  num_fargate_nodes = 25, 
+                  use_bit_dep_checking = True,
+                  executors_use_task_queue = True,
+                  ecs_task_definition = 'MyECSTaskDefinition',
+                  aws_region = "us-east-1") 
 client = Client(local_cluster)
 
 # Compute the SVD of 'Tall-and-Skinny' Matrix 
@@ -136,20 +132,19 @@ v.compute()
 ```python
 import dask.array as da
 from distributed import LocalCluster, Client
-lc = LocalCluster(host='ec2-3-16-83-131.us-east-2.compute.amazonaws.com:8786',
-                  proxy_address = 'ec2-3-133-154-219.us-east-2.compute.amazonaws.com',
-                  big_redis_endpoints = [('ec2-3-21-228-179.us-east-2.compute.amazonaws.com', 6379),
-                                         ('ec2-66-112-34-62.us-east-2.compute.amazonaws.com', 6379),
-                                         ('ec2-240-186-137-25.us-east-2.compute.amazonaws.com', 6379),
-                                         ('ec2-39-204-234-155.us-east-2.compute.amazonaws.com', 6379)],
-                  small_redis_endpoints = [('ec2-18-191-192-13.us-east-2.compute.amazonaws.com', 6379),
-                                           ('ec2-18-224-33-31.us-east-2.compute.amazonaws.com', 6379)],
+lc = LocalCluster(host='ec2-XX-XX-XXX-X.compute-1.amazonaws.com:8786',
+                  proxy_address = 'ec2-XX-XXX-X-XXX.compute-1.amazonaws.com',
                   n_workers = 0,
                   proxy_port = 8989,
                   num_lambda_invokers = 30,
-                  chunk_task_threshold = 10000000,
-                  max_task_fanout = 30,
-                  aws_region = "us-east-2") 
+                  chunk_large_tasks = False,
+                  big_task_threshold = 200_000_000,
+                  max_task_fanout = 330,
+                  num_fargate_nodes = 25, 
+                  use_bit_dep_checking = True,
+                  executors_use_task_queue = True,
+                  ecs_task_definition = 'MyECSTaskDefinition',
+                  aws_region = "us-east-1")  
 client = Client(local_cluster)
 
 # Compute the SVD of 'Tall-and-Skinny' Matrix 
@@ -165,20 +160,19 @@ v.compute()
 from dask import delayed 
 import operator 
 from distributed import LocalCluster, Client
-lc = LocalCluster(host='ec2-3-16-83-131.us-east-2.compute.amazonaws.com:8786',
-                  proxy_address = 'ec2-3-133-154-219.us-east-2.compute.amazonaws.com',
-                  big_redis_endpoints = [('ec2-3-21-228-179.us-east-2.compute.amazonaws.com', 6379),
-                                         ('ec2-66-112-34-62.us-east-2.compute.amazonaws.com', 6379),
-                                         ('ec2-240-186-137-25.us-east-2.compute.amazonaws.com', 6379),
-                                         ('ec2-39-204-234-155.us-east-2.compute.amazonaws.com', 6379)],
-                  small_redis_endpoints = [('ec2-18-191-192-13.us-east-2.compute.amazonaws.com', 6379),
-                                           ('ec2-18-224-33-31.us-east-2.compute.amazonaws.com', 6379)],
+lc = LocalCluster(host='ec2-XX-XX-XXX-X.compute-1.amazonaws.com:8786',
+                  proxy_address = 'ec2-XX-XXX-X-XXX.compute-1.amazonaws.com',
                   n_workers = 0,
                   proxy_port = 8989,
                   num_lambda_invokers = 30,
-                  chunk_task_threshold = 10000000,
-                  max_task_fanout = 30,
-                  aws_region = "us-east-2") 
+                  chunk_large_tasks = False,
+                  big_task_threshold = 200_000_000,
+                  max_task_fanout = 330,
+                  num_fargate_nodes = 25, 
+                  use_bit_dep_checking = True,
+                  executors_use_task_queue = True,
+                  ecs_task_definition = 'MyECSTaskDefinition',
+                  aws_region = "us-east-1") 
 client = Client(local_cluster)
 
 L = range(1024)
@@ -193,20 +187,19 @@ L[0].compute()
 ``` python
 import dask.array as da
 from distributed import LocalCluster, Client
-lc = LocalCluster(host='ec2-3-16-83-131.us-east-2.compute.amazonaws.com:8786',
-                  proxy_address = 'ec2-3-133-154-219.us-east-2.compute.amazonaws.com',
-                  big_redis_endpoints = [('ec2-3-21-228-179.us-east-2.compute.amazonaws.com', 6379),
-                                         ('ec2-66-112-34-62.us-east-2.compute.amazonaws.com', 6379),
-                                         ('ec2-240-186-137-25.us-east-2.compute.amazonaws.com', 6379),
-                                         ('ec2-39-204-234-155.us-east-2.compute.amazonaws.com', 6379)],
-                  small_redis_endpoints = [('ec2-18-191-192-13.us-east-2.compute.amazonaws.com', 6379),
-                                           ('ec2-18-224-33-31.us-east-2.compute.amazonaws.com', 6379)],
+lc = LocalCluster(host='ec2-XX-XX-XXX-X.compute-1.amazonaws.com:8786',
+                  proxy_address = 'ec2-XX-XXX-X-XXX.compute-1.amazonaws.com',
                   n_workers = 0,
                   proxy_port = 8989,
                   num_lambda_invokers = 30,
-                  chunk_task_threshold = 10000000,
-                  max_task_fanout = 30,
-                  aws_region = "us-east-2") 
+                  chunk_large_tasks = False,
+                  big_task_threshold = 200_000_000,
+                  max_task_fanout = 330,
+                  num_fargate_nodes = 25, 
+                  use_bit_dep_checking = True,
+                  executors_use_task_queue = True,
+                  ecs_task_definition = 'MyECSTaskDefinition',
+                  aws_region = "us-east-1") 
 client = Client(local_cluster)
 
 x = da.random.random((10000, 10000), chunks = (1000, 1000))
@@ -227,20 +220,19 @@ from sklearn.svm import SVC
 import dask_ml.datasets
 from dask_ml.wrappers import ParallelPostFit
 from distributed import LocalCluster, Client
-lc = LocalCluster(host='ec2-3-16-83-131.us-east-2.compute.amazonaws.com:8786',
-                  proxy_address = 'ec2-3-133-154-219.us-east-2.compute.amazonaws.com',
-                  big_redis_endpoints = [('ec2-3-21-228-179.us-east-2.compute.amazonaws.com', 6379),
-                                         ('ec2-66-112-34-62.us-east-2.compute.amazonaws.com', 6379),
-                                         ('ec2-240-186-137-25.us-east-2.compute.amazonaws.com', 6379),
-                                         ('ec2-39-204-234-155.us-east-2.compute.amazonaws.com', 6379)],
-                  small_redis_endpoints = [('ec2-18-191-192-13.us-east-2.compute.amazonaws.com', 6379),
-                                           ('ec2-18-224-33-31.us-east-2.compute.amazonaws.com', 6379)],
+lc = LocalCluster(host='ec2-XX-XX-XXX-X.compute-1.amazonaws.com:8786',
+                  proxy_address = 'ec2-XX-XXX-X-XXX.compute-1.amazonaws.com',
                   n_workers = 0,
                   proxy_port = 8989,
                   num_lambda_invokers = 30,
-                  chunk_task_threshold = 10000000,
-                  max_task_fanout = 30,
-                  aws_region = "us-east-2")  
+                  chunk_large_tasks = False,
+                  big_task_threshold = 200_000_000,
+                  max_task_fanout = 330,
+                  num_fargate_nodes = 25, 
+                  use_bit_dep_checking = True,
+                  executors_use_task_queue = True,
+                  ecs_task_definition = 'MyECSTaskDefinition',
+                  aws_region = "us-east-1")  
 client = Client(local_cluster)
 
 X, y = sklearn.datasets.make_classification(n_samples=1000)
