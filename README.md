@@ -7,27 +7,27 @@ https://arxiv.org/abs/1910.05896
 
 This branch contains what is roughly the latest version of Wukong. Of course, this is still a work-in-progress. There are likely to be bugs.
 
-## What's new in this branch?
+<!--- ## What's new in this branch?
 
-This version of Wukong adopts a "tiered" approach to Redis -- it uses a bunch of VMs, generally multiple hosted on the same machine. Some VMs are reserved for "large" objects while others are used exclusively for "small" objects. The "large" object threshold is a configurable paramater on the Static Scheduler. 
+<!--- This version of Wukong adopts a "tiered" approach to Redis -- it uses a bunch of VMs, generally multiple hosted on the same machine. Some VMs are reserved for "large" objects while others are used exclusively for "small" objects. The "large" object threshold is a configurable paramater on the Static Scheduler. 
 
-There is a script `CreateAndPrintRedisInfo.py` which greatly simplifies the process of provisioning Redis. You give this script the ports you wish to use, and the script will create the Redis instances for you. It gets the IPs using the EC2 AWS API. It automatically selects the VM to be used as the Scheduler and the proxy, also. Currently you cannot specify this yourself. The script does not start either of these applications on the VMs, but it reserves two IP addresses to use for the Scheduler and the proxy.
+<!--- There is a script `CreateAndPrintRedisInfo.py` which greatly simplifies the process of provisioning Redis. You give this script the ports you wish to use, and the script will create the Redis instances for you. It gets the IPs using the EC2 AWS API. It automatically selects the VM to be used as the Scheduler and the proxy, also. Currently you cannot specify this yourself. The script does not start either of these applications on the VMs, but it reserves two IP addresses to use for the Scheduler and the proxy.
 
-The script also generates boiler plate code that you can use when starting Wukong (both the Static Scheduler and the KV Store Proxy). You can also copy-and-paste a portion of the code generated for the Static Scheduler to use with the Lambda functions. You may need to modify the commands that are executed in the script to target your OS. I've been using it with the [Amazon Linux AMI](https://aws.amazon.com/amazon-linux-ami/). (The Amazon Linux AMI is what all of this has been tested on.)
+<!---The script also generates boiler plate code that you can use when starting Wukong (both the Static Scheduler and the KV Store Proxy). You can also copy-and-paste a portion of the code generated for the Static Scheduler to use with the Lambda functions. You may need to modify the commands that are executed in the script to target your OS. I've been using it with the [Amazon Linux AMI](https://aws.amazon.com/amazon-linux-ami/). (The Amazon Linux AMI is what all of this has been tested on.)
 
-If you need any help using the script, please contact me. It isn't exactly cleaned up for public use -- it's just something we've been using to make our lives easier. There is some explanation at the top of the file, but I suspect it will still be hard to use the script for anyone else. 
+<!---If you need any help using the script, please contact me. It isn't exactly cleaned up for public use -- it's just something we've been using to make our lives easier. There is some explanation at the top of the file, but I suspect it will still be hard to use the script for anyone else. 
 
-The code for the AWS Lambda function (i.e., Task Executor) has also changed considerably. There are a number of changes aside from the changes to Redis. For one, when a Task Executor completes a task whose output data is large, it will attempt to execute downstream tasks locally until the output data is small. This is done to minimize the amount of network communication performed for large objects. 
+<!--- The code for the AWS Lambda function (i.e., Task Executor) has also changed considerably. There are a number of changes aside from the changes to Redis. For one, when a Task Executor completes a task whose output data is large, it will attempt to execute downstream tasks locally until the output data is small. This is done to minimize the amount of network communication performed for large objects. 
 
-At a high level, there are two distinct ways tasks are processed after being executed. The way that the task is processed depends on whether or not its intermediate output data is large or small (based on a user-defined threshold). If it is small, then the processing is basically the same as before (and occurs in the `process_small` function). If the data is large, then, as mentioned, the Lambda will attempt to execute downstream tasks locally if at all possible. This is done in the `process_big` function. 
+<!---At a high level, there are two distinct ways tasks are processed after being executed. The way that the task is processed depends on whether or not its intermediate output data is large or small (based on a user-defined threshold). If it is small, then the processing is basically the same as before (and occurs in the `process_small` function). If the data is large, then, as mentioned, the Lambda will attempt to execute downstream tasks locally if at all possible. This is done in the `process_big` function. 
 
-The `chunk_task_threshold` parameter to `LocalCluster` is currently being used to determine whether intermediate data is large enough to warrant executing downstream tasks locally or not. If `size(DATA) >= chunk_task_threshold` then the downstream tasks would be executed locally if circumstances permit (i.e., they're ready to execute). Note that the units of `chunk_task_threshold` are bytes. 
+<!--- The `chunk_task_threshold` parameter to `LocalCluster` is currently being used to determine whether intermediate data is large enough to warrant executing downstream tasks locally or not. If `size(DATA) >= chunk_task_threshold` then the downstream tasks would be executed locally if circumstances permit (i.e., they're ready to execute). Note that the units of `chunk_task_threshold` are bytes. 
 
-As far as running Wukong goes, the Lambda function (Task Executor) now needs to be given a hard-coded list of the "large object" Redis shards and the "small object" Redis shards. The format for these lists is `[(IP_1, Port_1), (IP_2, Port_2), ..., (IP_n, Port_n)]`. The variables are at the top of `function.py` in the "AWS Lambda Task Executor" folder. 
+<!--- As far as running Wukong goes, the Lambda function (Task Executor) now needs to be given a hard-coded list of the "large object" Redis shards and the "small object" Redis shards. The format for these lists is `[(IP_1, Port_1), (IP_2, Port_2), ..., (IP_n, Port_n)]`. The variables are at the top of `function.py` in the "AWS Lambda Task Executor" folder. 
 
-The command for starting the KV Store Proxy has also changed. If you use the script mentioned above, then the command will be generated for you. (You'll just need to copy-and-paste it into your terminal). 
+<!--- The command for starting the KV Store Proxy has also changed. If you use the script mentioned above, then the command will be generated for you. (You'll just need to copy-and-paste it into your terminal). 
 
-If you encounter any issues understanding or running this version of Wukong, please contact us and we'll be happy to help troubleshoot or explain. We will also be updating the documentation as time goes on.
+<!--- If you encounter any issues understanding or running this version of Wukong, please contact us and we'll be happy to help troubleshoot or explain. We will also be updating the documentation as time goes on.
 
 ## What is Wukong?
 
