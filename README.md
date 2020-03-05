@@ -17,6 +17,8 @@ Wukong is a serverless DAG scheduler attuned to AWS Lambda. Wukong provides dece
 
 *This section is currently under development...*
 
+The most update-to-date branch is currently "fargate-storage", NOT "latest". 
+
 ### The Static Scheduler
 
 Generally speaking, a user submits a job by calling the `.compute()` function on an underlying Dask collection. Support for Dask's asynchronous `client.compute()` API is coming soon.
