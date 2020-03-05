@@ -69,7 +69,13 @@ There is also a variable referencing the function's name in "Static Scheduler/di
 
 By default, Wukong is configured to run within the us-east-1 region. If you would like to use a different region, then you need to pass the "region_name" parameter to the Lambda Client objects created in "Static Scheduler/distributed/batched_lambda_invoker.py", "KV Store Proxy/proxy_lambda_invoker.py", "KV Store Proxy/proxy.py", "AWS Lambda Task Executor/function.py", and "Static Scheduler/distributed/scheduler.py".
 
-There is a script `CreateAndPrintRedisInfo.py` which greatly simplifies the process of provisioning Redis. A description of the script is provided above in the "What's new in this branch?" section.
+<!--- There is a script `CreateAndPrintRedisInfo.py` which greatly simplifies the process of provisioning Redis. A description of the script is provided above in the "What's new in this branch?" section. ---> 
+
+The AWS Lambda function requires a few layers to run. These layers can be included directly with the following ARN's:
+
+arn:aws:lambda:us-east-1:561589293384:layer:DaskLayer2:2
+arn:aws:lambda:us-east-1:561589293384:layer:DaskDependenciesAndXRay:6
+arn:aws:lambda:us-east-1:561589293384:layer:dask-ml-layer:9
 
 ## Code Examples
 
