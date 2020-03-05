@@ -74,7 +74,9 @@ By default, Wukong is configured to run within the us-east-1 region. If you woul
 The AWS Lambda function requires a few layers to run. These layers can be included directly with the following ARN's:
 
 arn:aws:lambda:us-east-1:561589293384:layer:DaskLayer2:2
+
 arn:aws:lambda:us-east-1:561589293384:layer:DaskDependenciesAndXRay:6
+
 arn:aws:lambda:us-east-1:561589293384:layer:dask-ml-layer:9
 
 ## Code Examples
