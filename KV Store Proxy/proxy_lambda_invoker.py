@@ -50,16 +50,7 @@ class ProxyLambdaInvoker(object):
     a myriad of tiny tasks.
     
     """
-
-    # XXX why doesn't BatchedSend follow either the IOStream or Comm API?
-    # AsynchronousDaskExecutor
-    # DeserializedDaskExecutor
-    # UpdatedAlgorithmDaskExecutor
-    # ModifiedPathDaskExecutor
-    # RedisPartitioningDaskExecutor
-    # ProxyPubSubDaskExecutor
-    # RedisMultipleVMsExecutor
-    # WukongExecutor
+    
     def __init__(self, interval = "5ms", use_multiple_invokers = True, function_name="WukongExecutor", num_invokers = 8, redis_channel_names = None, debug_print = False, 
             chunk_size = 5, loop=None, serializers=None, minimum_tasks_for_multiple_invokers = 8, redis_channel_names_for_proxy = None):
         # XXX is the loop arg useful?
@@ -163,30 +154,8 @@ class ProxyLambdaInvoker(object):
                 # send_start_time = time.time()
 
                 # Send each chunk to an invocation of the AWS Lambda function for evaluation.
-                # total_time_spent_serializing = 0
-                # total_time_spent_invoking = 0
                 for payload in scheduler_payload:
-                    # time_invoke_start = time.time()
-                    #remote = self.ntp_client.request("north-america.pool.ntp.org")
-                    #invoke_time = remote.dest_time + remote.offset        
-                    #_payload = {"event": payload, "invoke-time": invoke_time}
                     self.lambda_client.invoke(FunctionName=self.lambda_function_name, InvocationType='Event', Payload = payload)
-                    # time_invoke_end = time.time()
-                    # diff_invoke = time_invoke_end - time_invoke_start
-                    # total_time_spent_invoking += diff_invoke 
-                # send_done_time = time.time()
-                
-                # self.total_lambdas_invoked = self.total_lambdas_invoked + len(scheduler_payload)
-                # self.num_tasks_invoked = self.num_tasks_invoked + len(scheduler_payload)                
-                # timestamp_now = datetime.datetime.utcnow()
-                
-                # The self.time_spent_invoking variable is the total time we've spent calling invoke() over the
-                # entire lifetime of this Scheduler/batched lambda invoker object (not just the most recent set of invocations).
-                # self.time_spent_invoking += total_time_spent_invoking
-                # print("\n[ {} ] BatchedLambdaInvoker - INFO: Invoked {} Lambda functions in {} seconds.".format(timestamp_now, len(scheduler_payload), send_done_time - send_start_time))
-                # print("                               Serialization took {} seconds. Invocation took {} seconds.".format(total_time_spent_serializing, total_time_spent_invoking))
-                # print("                               Total Lambdas Invoked: {}. Total # Tasks Invoked: {}".format(self.total_lambdas_invoked, self.num_tasks_invoked))
-                # print("                               The Proxy has spent {} seconds calling invoke() so far.".format(self.time_spent_invoking))
             except Exception:
                 #logger.exception("Error in batched write")
                 print("Error in batched write.")
@@ -202,12 +171,7 @@ class ProxyLambdaInvoker(object):
         This completes quickly and synchronously
         """
         self.message_count += 1
-        #msg["redis-proxy-channel"] = self.redis_channel_names_for_proxy[self.current_redis_channel_index_for_proxy]
-        #self.current_redis_channel_index_for_proxy = self.current_redis_channel_index_for_proxy + 1
 
-        # Make sure the 'current_redis_channel_index_for_proxy' variable is still a valid value. 
-        #if (self.current_redis_channel_index_for_proxy >= len(self.redis_channel_names_for_proxy)):
-        #    self.current_redis_channel_index_for_proxy = 0
         self.buffer.append(msg)
         
         # Avoid spurious wakeups if possible

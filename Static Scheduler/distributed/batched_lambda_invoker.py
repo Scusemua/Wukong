@@ -33,6 +33,16 @@ class BatchedLambdaInvoker(object):
     a myriad of tiny tasks.
     
     """
+
+    # XXX why doesn't BatchedSend follow either the IOStream or Comm API?
+    # AsynchronousDaskExecutor
+    # DeserializedDaskExecutor
+    # UpdatedAlgorithmDaskExecutor
+    # ModifiedPathDaskExecutor
+    # RedisPartitioningDaskExecutor
+    # ProxyPubSubDaskExecutor
+    # RedisMultipleVMsExecutor
+    # WukongExecutor
     def __init__(self, interval, use_multiple_invokers = True, function_name="WukongExecutor", num_invokers = 16, redis_channel_names = None, debug_print = False, 
             chunk_size = 5, loop=None, serializers=None, minimum_tasks_for_multiple_invokers = 8, aws_region = 'us-east-1'):
         # XXX is the loop arg useful?
