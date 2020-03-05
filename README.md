@@ -33,7 +33,7 @@ If you encounter any issues understanding or running this version of Wukong, ple
 
 Wukong is a serverless DAG scheduler attuned to AWS Lambda. Wukong provides decentralized scheduling using a combination of static and dynamic scheduling. Wukong supports general Python data analytics workloads. 
 
-![Architecture](https://i.imgur.com/TSHldjg.png "Wukong's Architecture")
+<!--- ![Architecture](https://i.imgur.com/XXXXXX.png "Wukong's Architecture") --->
 
 ## Code Overview/Explanation 
 
