@@ -1,3 +1,5 @@
+## NOTE: Although this branch is named "latest", it is NOT the most-recent branch. As of right now, the most-recent branch is "fargate-storage".
+
 # Wukong
 
 A fast and efficient serverless DAG engine.
