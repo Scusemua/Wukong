@@ -1,11 +1,15 @@
 # Wukong
 
+## This is an old/outdated repository. Please see this repository for the most up-to-date Wukong code: https://github.com/mason-leap-lab/Wukong
+
 A fast and efficient serverless DAG engine.
 
 Paper: In Search of a Fast and Efficient Serverless DAG Engine
 https://arxiv.org/abs/1910.05896
 
-This branch contains the version of Wukong used during the writing of the paper linked above. For the latest work-in-progress version of Wukong, please see the [Latest](hhttps://github.com/mason-leap-lab/Wukong/tree/socc2020) branch.
+This branch contains the version of Wukong used during the writing of the paper linked above. 
+
+For the latest work-in-progress version of Wukong, please see the [Latest](hhttps://github.com/mason-leap-lab/Wukong/tree/socc2020) branch.
 
 ## What is Wukong?
 
